@@ -1,0 +1,181 @@
+---
+title: Core Memory Loop (add → search → update strategy)
+description: Deep dive into Mem0's core memory loop in mem0/memory/main.py, including fact extraction, retrieval, memory actions, and practical reasoning walkthrough.
+icon: "arrows-rotate"
+iconType: "solid"
+---
+
+# 核心记忆闭环：`add -> search -> 更新策略`
+
+这篇文档专门拆解 Mem0 在 `mem0/memory/main.py` 里的“记忆层”核心闭环：
+
+1. 从对话提取事实
+2. 检索已有记忆
+3. 决策 `ADD / UPDATE / DELETE / NONE`
+4. 返回可用记忆（供后续 `search`）
+
+> 关键理解：**记忆层不是聊天记录仓库**。聊天记录是原始事件流；记忆层是经过抽取、去重、冲突消解后的“可检索知识状态”。
+
+## 1) 入口：`add()` 做了什么
+
+`add()` 首先做三类工作：
+
+- 规范输入（字符串 / 单条 dict / 列表）并校验至少有一个会话范围 ID（`user_id` / `agent_id` / `run_id`）。
+- 处理特殊分支（如 procedural memory）。
+- 并发触发向量记忆写入 `_add_to_vector_store()` 与图记忆 `_add_to_graph()`。
+
+对应代码位于 `Memory.add()`。`_build_filters_and_metadata()` 把会话范围同时写入“存储 metadata 模板”和“查询 filters”，确保 add/search 同一作用域。`add()` 中再并发执行向量与图写入并合并结果。 
+
+## 2) 核心：`_add_to_vector_store()` 的双模式
+
+### 模式 A：`infer=False`（原样落库）
+
+当 `infer=False` 时，逻辑是“逐消息直接写入”：
+
+- 跳过非法消息与 `system`。
+- 继承 metadata，补充 `role` 与可选 `actor_id`。
+- 直接 embedding + `_create_memory()`，事件统一记为 `ADD`。
+
+这条路径**不做冲突消解**，因此更接近“消息归档”。
+
+### 模式 B：`infer=True`（默认，记忆闭环）
+
+这是核心闭环路径：
+
+1. `parse_messages()` 将多轮对话拼成可抽取文本。
+2. 用 `get_fact_retrieval_messages()` 组 prompt，让 LLM 抽取 `facts`。
+3. 对每条 fact 做向量检索（top-5），在当前会话范围内收集旧记忆。
+4. 将“新 facts + 旧记忆列表”喂给 `get_update_memory_messages()`，让 LLM 输出结构化动作：`ADD / UPDATE / DELETE / NONE`。
+5. 执行动作：
+   - `ADD` → `_create_memory()`
+   - `UPDATE` → `_update_memory()`
+   - `DELETE` → `_delete_memory()`
+   - `NONE` → 不改内容；必要时补齐会话字段（例如补 `agent_id/run_id`）
+
+此外，代码里做了一个“防 UUID 幻觉”步骤：把真实 memory id 映射成临时数字 id 给 LLM，再映射回真实 UUID 执行更新/删除。
+
+## 3) `search()`：把“记忆状态”返回给应用
+
+`search()` 不是在聊天原文里找，而是在向量记忆中检索：
+
+- 先构建作用域过滤器（至少一个会话 ID）。
+- 对 query 做 embedding，向量搜索 `_search_vector_store()`。
+- 可选阈值过滤、可选 reranker 重排。
+- 返回结构化 memory item（`id/memory/score/...`），并可附图关系结果。
+
+这使得上层应用拿到的是“压缩后的可用知识”，而不是原始 transcript。
+
+## 4) 为什么说“记忆层 ≠ 聊天记录存储”
+
+### 聊天记录存储（Transcript Store）
+
+- 目标：保真、可审计、可回放。
+- 粒度：每轮消息都存。
+- 冲突策略：通常没有，原样保留。
+
+### 记忆层（Memory Layer）
+
+- 目标：可检索、可泛化、可更新。
+- 粒度：事实/偏好/约束等“知识单元”。
+- 冲突策略：通过 `ADD/UPDATE/DELETE/NONE` 演进为“当前知识状态”。
+
+在 Mem0 里，`infer=True` 路径体现的是“知识维护系统”；`infer=False` 则更接近“原始消息写入”。
+
+## 5) 完整案例：一步一步推理演示
+
+### 场景
+
+同一用户 `user_id="u_42"` 先后三轮输入：
+
+1. `"我最喜欢的咖啡是燕麦拿铁"`
+2. `"最近改了，我现在更喜欢美式"`
+3. `"别记错，我不喝加糖咖啡"`
+
+### 第一次 add（初始建立）
+
+- 抽取 facts（可能得到）：
+  - 喜欢燕麦拿铁
+- 检索旧记忆：空
+- 更新策略：`ADD`
+- 结果：新增 memory A
+
+### 第二次 add（偏好变更）
+
+- 抽取 facts：
+  - 现在更喜欢美式
+- 检索旧记忆：命中 memory A（咖啡偏好相关）
+- 更新策略：高概率 `UPDATE`（同一偏好维度新信息覆盖旧信息）
+- 结果：memory A 文本被更新为“更喜欢美式”
+
+### 第三次 add（新增约束）
+
+- 抽取 facts：
+  - 不喝加糖咖啡
+- 检索旧记忆：可能命中咖啡相关记忆
+- 更新策略：通常 `ADD`（新维度约束），或在某些 prompt 策略下 `UPDATE` 为更完整偏好
+- 结果：memory B 新增（或 A 扩展）
+
+### 最终 search
+
+查询：`"给我推荐一杯咖啡"`
+
+- `search()` 在 `u_42` 范围检索到当前有效记忆（如“喜欢美式”“不喝加糖”）
+- 上层 agent 基于此生成更贴合的推荐
+
+## 6) ANSI Art 时序图（核心闭环）
+
+```text
++--------+          +------------------+          +-------------------+
+| Client |          | Memory.add()     |          | _add_to_vector... |
++---+----+          +---------+--------+          +---------+---------+
+    |                         |                             |
+    | add(messages, ids)      |                             |
+    |------------------------>|                             |
+    |                         | normalize + scope filters   |
+    |                         |---------------------------->|
+    |                         |                             | parse_messages
+    |                         |                             | fact extraction (LLM)
+    |                         |                             |-----> facts[]
+    |                         |                             | for fact in facts:
+    |                         |                             |   vector_search(top5)
+    |                         |                             |<----- old_memories
+    |                         |                             | build update prompt
+    |                         |                             | action LLM
+    |                         |                             |-----> [{event,...}]
+    |                         |                             | execute:
+    |                         |                             | ADD/UPDATE/DELETE/NONE
+    |                         |<----------------------------| returned_memories
+    |<------------------------| merge vector(+graph) result |
+    |  {results:[...]}        |                             |
+    |                         |                             |
+    | search(query, ids)      |                             |
+    |------------------------>|                             |
+    |                         | _search_vector_store        |
+    |                         |---- embed + vector search --|
+    |                         |<--- memory items (+score) --|
+    |<------------------------| {results:[memory items]}    |
+```
+
+## 7) 实战结论（给工程实现者）
+
+- 若你要“长期个性化”，默认用 `infer=True`，让系统持续维护知识状态。
+- 若你要“会话审计/回放”，应单独保存聊天日志，不要把记忆层当日志库。
+- 若同时需要两者：
+  - Transcript：存全量消息（审计）
+  - Memory：存抽取事实（检索与推理）
+- `search()` 的价值在于返回“当前可用知识”，而不是“历史原文”。
+
+<CardGroup cols={2}>
+  <Card
+    title="Add Memory"
+    description="查看 add 操作概览与入门示例"
+    icon="plus"
+    href="/core-concepts/memory-operations/add"
+  />
+  <Card
+    title="Search Memory"
+    description="查看 search 检索流程与过滤能力"
+    icon="search"
+    href="/core-concepts/memory-operations/search"
+  />
+</CardGroup>
