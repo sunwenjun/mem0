@@ -1,0 +1,247 @@
+# 作用域模型深度解析：`user_id` / `agent_id` / `run_id`
+
+本文基于 `mem0/memory/main.py` 的实现，系统性拆解 Mem0 的“会话隔离”策略。核心结论是：
+
+- **写入时**：把作用域 ID 写入 metadata（`base_metadata_template`）。
+- **查询时**：把作用域 ID 作为 filters（`effective_query_filters`）。
+- **统一入口**：所有关键 API 通过 `_build_filters_and_metadata()` 先做同一套归一化，防止串线。
+
+---
+
+## 1) 统一作用域构建函数：`_build_filters_and_metadata()`
+
+函数签名：
+
+```python
+_build_filters_and_metadata(
+    user_id=None,
+    agent_id=None,
+    run_id=None,
+    actor_id=None,
+    input_metadata=None,
+    input_filters=None,
+) -> (base_metadata_template, effective_query_filters)
+```
+
+它做了 4 件关键事：
+
+1. 初始化两个上下文：
+   - `base_metadata_template`（用于写入）
+   - `effective_query_filters`（用于查询）
+2. 将 `user_id` / `agent_id` / `run_id` **同时写入 metadata 与 filters**。
+3. 如果三者都没传，直接抛错（`VALIDATION_001`）。
+4. `actor_id` 只用于查询过滤：优先级 `显式 actor_id 参数 > filters.actor_id`。
+
+这保证了“写入域”和“查询域”使用同一套 ID 语义，避免 API 各自拼过滤条件造成不一致。
+
+---
+
+## 2) 作用域如何贯穿增删查改
+
+### A. `add()`（写入）
+
+`add()` 一开始就调用 `_build_filters_and_metadata()`：
+
+- `processed_metadata`：传给 `_add_to_vector_store()`，最终落到每条 memory payload。
+- `effective_filters`：用于“更新推理”时检索旧记忆（只在当前作用域内查重/合并）。
+
+在 `infer=False` 的直接写入路径中：
+
+- 每条消息复制一份 metadata。
+- 自动补 `role`。
+- 若消息有 `name`，写入 `actor_id`。
+
+在 `infer=True` 的推理路径中：
+
+- 会先抽取 facts。
+- 再按 `user_id`/`agent_id`/`run_id` 过滤检索已有记忆，保证“只在同作用域内做更新决策”。
+
+### B. `get_all()` / `search()`（读取）
+
+这两个 API 同样先调用 `_build_filters_and_metadata()`，所以默认会把 ID 作用域并入查询条件。
+
+- `get_all()`：按作用域列举。
+- `search()`：语义检索 + 作用域过滤。
+- 两者都要求至少一个作用域 ID。
+
+`search()` 还支持高级 metadata 运算（`AND/OR/NOT`, `eq/ne/in/...`），但这些扩展条件是叠加在作用域过滤之上，不替代作用域。
+
+### C. `update()` / `delete()`（按 memory_id）
+
+这两个 API 是单条 ID 操作，不经过 `_build_filters_and_metadata()`：
+
+- `update(memory_id, data)`：直接按主键更新。
+- `delete(memory_id)`：直接按主键删除。
+
+这不是串线风险点，因为调用方已持有具体 memory_id。
+
+### D. `delete_all()`（批量删除）
+
+`delete_all(user_id=None, agent_id=None, run_id=None)` 自己拼过滤条件，不走 `_build_filters_and_metadata()`，但仍要求至少一个作用域 ID。
+
+> 这意味着它与统一函数“精神一致”，只是实现路径独立。
+
+---
+
+## 3) 完整案例（一步一步推演）
+
+下面构造一个真实的多租户场景，展示“为什么不会串线”。
+
+### 场景设定
+
+- 用户：`user_id = u_alice`
+- Agent：`agent_id = a_sales`
+- 会话运行：`run_id = r_2026_02_21_01`
+
+请求：
+
+```python
+memory.add(
+  messages=[
+    {"role": "user", "content": "我下周去上海出差"},
+    {"role": "assistant", "name": "planner", "content": "已为你预留周三晚高铁"}
+  ],
+  user_id="u_alice",
+  agent_id="a_sales",
+  run_id="r_2026_02_21_01",
+  metadata={"tenant": "cn", "channel": "wechat"},
+  infer=False,
+)
+```
+
+### Step 1：进入 `_build_filters_and_metadata()`
+
+得到：
+
+- `base_metadata_template`：
+
+```json
+{
+  "tenant": "cn",
+  "channel": "wechat",
+  "user_id": "u_alice",
+  "agent_id": "a_sales",
+  "run_id": "r_2026_02_21_01"
+}
+```
+
+- `effective_query_filters`：
+
+```json
+{
+  "user_id": "u_alice",
+  "agent_id": "a_sales",
+  "run_id": "r_2026_02_21_01"
+}
+```
+
+### Step 2：`infer=False` 逐条写入
+
+第一条 user 消息写入 payload（示意）：
+
+```json
+{
+  "data": "我下周去上海出差",
+  "user_id": "u_alice",
+  "agent_id": "a_sales",
+  "run_id": "r_2026_02_21_01",
+  "tenant": "cn",
+  "channel": "wechat",
+  "role": "user"
+}
+```
+
+第二条 assistant 消息因为带了 `name=planner`，额外写入：
+
+```json
+{
+  "actor_id": "planner",
+  "role": "assistant"
+}
+```
+
+### Step 3：后续搜索
+
+```python
+memory.search(
+  query="出差安排",
+  user_id="u_alice",
+  agent_id="a_sales",
+  run_id="r_2026_02_21_01",
+  filters={"actor_id": "planner"}
+)
+```
+
+过滤条件会是：
+
+```json
+{
+  "user_id": "u_alice",
+  "agent_id": "a_sales",
+  "run_id": "r_2026_02_21_01",
+  "actor_id": "planner"
+}
+```
+
+因此只能命中同作用域且 actor 匹配的数据，不会看到：
+
+- 其他用户 `u_bob`
+- 同用户但其他 agent
+- 同用户同 agent 但其他 run
+
+---
+
+## 4) 一眼看懂：为什么这套模型不易串线
+
+- **强制最小作用域约束**：三类 ID 至少一个，不允许“裸操作”。
+- **写读同构**：写入 metadata 与读取 filters 使用同源 ID。
+- **跨 API 一致性**：`add/get_all/search` 统一走同一个构建器。
+- **细粒度补充维度**：`actor_id` 作为可选查询维度，避免把角色筛选和租户隔离混在一起。
+
+---
+
+## 5) ANSI Art 时序图（作用域生命周期）
+
+```ansi
++----------------+      +-----------------------------+      +-------------------+      +----------------+
+|   Client/API   |      | _build_filters_and_metadata |      |   Memory Service  |      |  Vector Store  |
++----------------+      +-----------------------------+      +-------------------+      +----------------+
+        |                              |                               |                           |
+        | add(user_id,agent_id,run_id)|                               |                           |
+        |----------------------------->|                               |                           |
+        |                              | validate >=1 scope id         |                           |
+        |                              | build metadata + filters      |                           |
+        |<-----------------------------|                               |                           |
+        |                              |                               | _add_to_vector_store      |
+        |                              |                               |-------------------------->|
+        |                              |                               | payload includes          |
+        |                              |                               | user_id/agent_id/run_id  |
+        |                              |                               | (optional actor_id/role) |
+        |                              |                               |<--------------------------|
+        |<-------------------------------------------------------------| add result                |
+        |                              |                               |                           |
+        | search(query, same scope...) |                               |                           |
+        |----------------------------->|                               |                           |
+        |                              | merge scope ids into filters  |                           |
+        |<-----------------------------|                               |                           |
+        |                              |                               | search(filters=scope+...) |
+        |                              |                               |-------------------------->|
+        |                              |                               | returns scoped memories   |
+        |                              |                               |<--------------------------|
+        |<-------------------------------------------------------------| search result             |
+        |                              |                               |                           |
++----------------+      +-----------------------------+      +-------------------+      +----------------+
+```
+
+---
+
+## 6) 实战建议
+
+1. 生产环境至少传 `user_id`，推荐三者都传（`user_id + agent_id + run_id`）。
+2. 若你要做“同会话不同角色”检索，使用 `actor_id` 过滤，不要拿 `agent_id` 代替。
+3. 批量清理优先用 `delete_all(user_id=...)`，不要直接 `reset()`（除非你明确要全量清空）。
+4. 排查串线时，先打印请求进入 `_build_filters_and_metadata()` 前后的对象：
+   - `input_metadata/input_filters`
+   - `base_metadata_template/effective_query_filters`
+
+这四个对象基本能定位 90% 的隔离问题。
