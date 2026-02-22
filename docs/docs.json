@@ -51,6 +51,7 @@
                     "pages": [
                       "core-concepts/memory-types",
                       "core-concepts/memory-operations/add",
+                      "core-concepts/memory-operations/core-memory-loop",
                       "core-concepts/memory-operations/search",
                       "core-concepts/memory-operations/update",
                       "core-concepts/memory-operations/delete"

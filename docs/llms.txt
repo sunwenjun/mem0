@@ -24,6 +24,7 @@ Key differentiators:
 
 - [Memory Types](https://docs.mem0.ai/core-concepts/memory-types): Working memory (short-term session awareness), factual memory (structured knowledge), episodic memory (past conversations), and semantic memory (general knowledge)
 - [Memory Operations - Add](https://docs.mem0.ai/core-concepts/memory-operations/add): How Mem0 processes conversations through information extraction, conflict resolution, and dual storage
+- [Core Memory Loop (add → search → update strategy)](https://docs.mem0.ai/core-concepts/memory-operations/core-memory-loop): Deep dive into the end-to-end memory lifecycle in `mem0/memory/main.py`, from fact extraction to action decisions (`ADD/UPDATE/DELETE/NONE`)
 - [Memory Operations - Search](https://docs.mem0.ai/core-concepts/memory-operations/search): Retrieval of relevant memories using semantic search with query processing and result ranking
 - [Memory Operations - Update](https://docs.mem0.ai/core-concepts/memory-operations/update): Modifying existing memories when new information conflicts or supplements stored data
 - [Memory Operations - Delete](https://docs.mem0.ai/core-concepts/memory-operations/delete): Removing outdated or irrelevant memories to maintain memory quality
