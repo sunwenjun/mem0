@@ -1,0 +1,256 @@
+# 多层记忆作用域（user_id / run_id / agent_id）源码实现详解
+
+本文面向想深入理解 Mem0 Python SDK 源码的开发者，回答两个核心问题：
+
+1. 多层作用域是“系统自动决策”还是“由调用方显式决定”？
+2. 除了“底层数据库/表结构不同”，不同存储后端在行为上还有哪些差异？
+
+---
+
+## 1) 结论先行
+
+### 1.1 作用域是谁决定的？
+
+**主结论：作用域由调用方在 API 参数里显式提供，系统负责统一编排和校验，不会替调用方自动猜测 user/run/agent。**
+
+- `Memory.add/get_all/search/delete_all` 等接口都把 `user_id` / `agent_id` / `run_id` 作为可选入参，但要求“至少一个”。
+- 统一函数 `_build_filters_and_metadata(...)` 会把这些入参写入：
+  - 存储用 `metadata`（payload）
+  - 检索用 `filters`
+- 如果三者都没给，直接抛 `Mem0ValidationError`。
+
+换句话说：
+
+- **“记忆归属到哪一层”是调用方策略。**
+- **“如何落盘与检索一致”是 SDK 机制。**
+
+### 1.2 不是三套互斥系统，而是“可组合作用域”
+
+单条记忆可以同时带多个 ID（例如同时有 `user_id + run_id`），查询时也可以同时按多个 ID 过滤。它不是“只能三选一”，而是“可叠加约束”。
+
+---
+
+## 2) 源码拆解：统一作用域函数如何工作
+
+核心函数：`mem0/memory/main.py::_build_filters_and_metadata`。
+
+### 2.1 输入
+
+- `user_id`, `agent_id`, `run_id`
+- `input_metadata`（写入 payload 的基础元数据）
+- `input_filters`（查询基础过滤器）
+- `actor_id`（可选，仅用于查询过滤优先级解析）
+
+### 2.2 输出
+
+返回两个字典：
+
+- `base_metadata_template`：用于后续写入向量库 payload
+- `effective_query_filters`：用于后续 list/search 等查询过滤
+
+### 2.3 关键规则
+
+1. 任何被提供的 session id（`user_id` / `agent_id` / `run_id`）都会同时进入 metadata + filters。
+2. 三者至少给一个，否则抛 `VALIDATION_001`。
+3. `actor_id` 是查询侧可选约束，不会自动写进“模板 metadata”（消息写入时再按 message `name` 决定）。
+
+---
+
+## 3) 调用链：从 add 到存储，再到搜索
+
+### 3.1 add：作用域先统一，再进入双写流程
+
+`Memory.add(...)` 第一件事就是调用 `_build_filters_and_metadata(...)`。之后并发执行：
+
+- `_add_to_vector_store(...)`：向量记忆
+- `_add_to_graph(...)`：图谱关系（若启用图存储）
+
+这意味着“同一套作用域过滤参数”会被同时传给向量侧和图侧。
+
+### 3.2 向量侧写入：作用域进 payload
+
+在 `_create_memory(...)` 中，最终会把完整 `metadata`（含 `user_id/agent_id/run_id`）连同 `data/hash/time` 一起写入 `vector_store.insert(...payloads=[metadata])`。
+
+即：**作用域是 payload 属性，不是额外的独立表字段抽象层（具体后端可能映射为 JSON/payload 字段）。**
+
+### 3.3 检索侧：同样作用域进 filters
+
+`get_all(...)`、`search(...)` 也先调用 `_build_filters_and_metadata(...)`，得到 `effective_filters` 后传入 `vector_store.list/search`。
+
+因此写入时和查询时都由同一个统一函数产出作用域信息，保证行为一致。
+
+---
+
+## 4) 作用域到底“自动”了什么？
+
+### 4.1 自动的部分
+
+- 自动做参数归一：把传入 ID 同步到 metadata + filters。
+- 自动做约束校验：至少一个 session id。
+- 自动做 actor 过滤优先级解析（`actor_id` 参数优先于 filters 里 actor_id）。
+
+### 4.2 不自动的部分
+
+- 不自动决定“该用 user 还是 run 还是 agent”。
+- 不自动把一次请求绑定到某个默认 run_id（除图谱分支 fallback user="user" 的特例，见后文）。
+
+所以这是一种**调用方显式分层、SDK 统一执行**的设计。
+
+---
+
+## 5) 除了“数据库不同”，还有哪些行为差异？
+
+有，而且不少。下面按“同一上层 API，下层差异”解释。
+
+### 5.1 过滤语义支持差异（重要）
+
+虽然 `Memory.search` 支持增强过滤操作符（`eq/gt/in/contains/AND/OR/...`）的统一入口，但具体向量库适配层实现能力并不完全一致。
+
+- 以 `PGVector.search/list` 为例：当前实现是把过滤翻译为 `payload->>%s = %s` 的等值条件拼接，偏“简单键值匹配”。
+- 以 `Qdrant` 为例：构造 `Filter` / `FieldCondition`，支持 range 场景（如 `gte/lte`）的结构化表达。
+
+**影响：** 同样的高阶过滤表达，在不同后端可能可用性和精度不一致。
+
+### 5.2 索引策略差异
+
+- `Qdrant` 远端模式会为 `user_id/agent_id/run_id/actor_id` 建 payload index，提高过滤效率。
+- `PGVector` 这里主要依赖 JSONB payload 条件 + 向量索引（HNSW/DiskANN 可选），没有同样的显式 payload field index 创建流程。
+
+**影响：** 高并发场景下按作用域过滤的性能曲线会因后端不同而变化。
+
+### 5.3 list 返回格式适配差异
+
+`_get_all_from_vector_store` 里专门做了“结果结构兼容处理”（判断是否 tuple/list 嵌套），因为不同后端 SDK 的返回形状并不统一。
+
+**影响：** 上层 API 看起来统一，但适配层内部有“结果解包”逻辑成本。
+
+### 5.4 图存储路径的差异行为
+
+`_add_to_graph` 若发现 filters 没有 `user_id`，会设置默认 `user_id="user"` 再写图。
+
+**影响：** 当你仅用 `agent_id/run_id` 时，向量侧仍保留这些真实作用域，但图侧可能落到默认 user 节点维度，语义上有“降级归一”的行为。
+
+### 5.5 历史审计是独立 SQLite，而不是向量库内建版本
+
+每次 `ADD/UPDATE/DELETE` 都通过 `SQLiteManager.add_history(...)` 记一条历史，包含 old/new、事件类型、时间、actor/role 等。
+
+**影响：** 存储不仅是“向量库中的当前态”，还有一份独立历史日志链路（可通过 `history(memory_id)` 查询）。
+
+---
+
+## 6) 完整案例（一步一步推演）
+
+下面给一个可组合作用域的完整示例：
+
+### 6.1 目标
+
+我们希望同时实现：
+
+- 用户长期偏好：`user_id="u_alice"`
+- 会话内临时偏好：`run_id="ticket_9527"`
+- 指定代理策略记忆：`agent_id="planner_v2"`
+
+### 6.2 写入
+
+调用（示意）：
+
+```python
+memory.add(
+  [{"role": "user", "content": "我早餐常喝燕麦奶"}],
+  user_id="u_alice",
+  run_id="ticket_9527",
+  agent_id="planner_v2",
+  metadata={"channel": "wechat"}
+)
+```
+
+推演：
+
+1. `_build_filters_and_metadata` 产出：
+   - metadata: `{channel, user_id, run_id, agent_id}`
+   - filters: `{user_id, run_id, agent_id}`
+2. `_add_to_vector_store` -> `_create_memory`
+   - payload 写入：`data/hash/created_at + 上述 metadata`
+3. 若启用图存储：`_add_to_graph`
+   - 用相同 filters 写图关系。
+
+### 6.3 查询（会话内）
+
+```python
+memory.search(
+  "她早餐喝什么",
+  user_id="u_alice",
+  run_id="ticket_9527",
+  agent_id="planner_v2",
+  limit=5
+)
+```
+
+推演：
+
+1. `_build_filters_and_metadata` 生成同样三层 filters。
+2. 向量库只会在满足三者同时匹配的 payload 上检索近邻。
+3. 返回结果时，`get/get_all/search` 会把 `user_id/run_id/agent_id/actor_id/role` 提升到顶层字段，剩余留在 `metadata`。
+
+### 6.4 查询（跨会话长期）
+
+```python
+memory.search("她长期早餐偏好", user_id="u_alice", limit=5)
+```
+
+此时只按 `user_id` 过滤，可召回跨 run 的长期记忆。
+
+### 6.5 结论
+
+同一份记忆系统内，**“长期/会话/代理”并非物理隔离三套库**，而是通过“组合过滤条件”实现多层语义视图。
+
+---
+
+## 7) ANSI Art 时序图（从调用到落盘/检索）
+
+```text
++-------------+        +----------------------+        +-------------------+
+|   Caller    |        | Memory.add/search    |        | _build_filters... |
++------+------+        +----------+-----------+        +---------+---------+
+       |                          |                              |
+       | add/search(user/run/agent, metadata/filters)          |
+       +------------------------->|                              |
+       |                          | normalize + validate IDs     |
+       |                          +----------------------------->|
+       |                          |<-----------------------------+
+       |                          | (metadata_template, filters) |
+       |                          |
+       |                          |------ add path --------------|
+       |                          |                              |
+       |                          | _add_to_vector_store         |
+       |                          +------------------------------>+------------------+
+       |                          |                              | VectorStore       |
+       |                          | _create_memory(payload=meta) | insert/search    |
+       |                          |-----------------------------> +------------------+
+       |                          |
+       |                          | (optional) _add_to_graph(filters)
+       |                          +------------------------------>+------------------+
+       |                          |                              | GraphStore        |
+       |                          |                              +------------------+
+       |                          |
+       |                          | history audit
+       |                          +------------------------------>+------------------+
+       |                          |                              | SQLite history DB |
+       |                          |                              +------------------+
+       |                          |
+       |<-------------------------+ result (promoted ids + metadata)
+       |
+```
+
+---
+
+## 8) 实践建议
+
+1. **把作用域策略放在业务层明确规定**：
+   - 哪些内容只挂 `user_id`
+   - 哪些内容加 `run_id`
+   - 哪些 agent 私有策略挂 `agent_id`
+2. **高阶 metadata 过滤要做后端一致性测试**（尤其跨 PGVector/Qdrant/Pinecone 等）。
+3. **若开启图存储，注意 `user_id` fallback 行为**，避免向量侧与图侧作用域语义偏差。
+4. **审计与回放依赖 SQLite history**，生产部署应关注该路径持久化策略。
+
