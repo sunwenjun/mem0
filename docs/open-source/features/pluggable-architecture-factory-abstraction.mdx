@@ -1,0 +1,273 @@
+---
+title: "Pluggable Architecture: Factory + Abstraction"
+description: "How Mem0 composes LLM, Embedding, VectorStore, Graph, and Reranker providers through factories and abstract interfaces."
+icon: "plug"
+---
+
+# Pluggable Architecture in Mem0
+
+你提到的重点非常准确：Mem0 的可插拔能力，核心就是 **Factory + 抽象层（ABC）+ 统一配置模型**。
+
+如果只看两处：
+
+- `mem0/utils/factory.py`
+- `mem0/vector_stores/base.py`
+
+就能看懂主干思路；再结合 `mem0/memory/main.py`、`mem0/*/base.py` 与 `mem0/*/configs.py`，会看到完整“装配—执行—扩展”闭环。
+
+---
+
+## 1) 架构目标：可替换，不改业务
+
+Mem0 的业务入口 `Memory` 类在初始化时并不直接依赖某个具体 SDK（例如 OpenAI/Qdrant），而是只依赖“能力位”：
+
+- LLM
+- Embedder
+- Vector Store
+- Graph Store
+- Reranker
+
+初始化时通过工厂按 `provider` 字符串创建实例：
+
+```python
+self.embedding_model = EmbedderFactory.create(...)
+self.vector_store = VectorStoreFactory.create(...)
+self.llm = LlmFactory.create(...)
+self.reranker = RerankerFactory.create(...)
+self.graph = GraphStoreFactory.create(...)
+```
+
+这意味着上层 `Memory.add/search/update/delete` 的流程不需要随着后端变化而变化。
+
+---
+
+## 2) Factory 如何实现“按名字装配”
+
+`mem0/utils/factory.py` 中每个 Factory 都维护了 `provider_to_class` 映射：
+
+- key: provider 名称（如 `openai`, `faiss`, `cohere`）
+- value: 具体类路径（部分还带 config class）
+
+### 2.1 动态加载
+
+统一通过 `load_class("module.Class")` 动态导入：
+
+1. `rsplit('.', 1)` 拆出模块路径和类名
+2. `importlib.import_module(module_path)`
+3. `getattr(module, class_name)`
+
+这样新增 provider 时，通常只需：
+
+- 新建 provider 实现类
+- 注册映射（静态字典或 `register_provider`）
+
+无需改 `Memory` 业务逻辑。
+
+### 2.2 配置适配（尤其是 LLM/Reranker）
+
+`LlmFactory` / `RerankerFactory` 除了选类，还做了“配置归一化”：
+
+- `config is None`：用 provider 对应 config class + kwargs 创建默认配置
+- `config is dict`：合并 kwargs 后构造 config class
+- `config is BaseLlmConfig`：必要时转换到 provider-specific config
+
+这个设计兼容了：
+
+- 老式通用配置
+- 新式 provider-specific 配置
+
+迁移成本更低。
+
+---
+
+## 3) 抽象层（ABC）如何约束能力面
+
+Factory 解决“创建谁”，抽象层解决“必须会什么”。
+
+### 3.1 VectorStore 抽象契约
+
+`mem0/vector_stores/base.py` 的 `VectorStoreBase` 强制定义：
+
+- `insert/search/delete/update/get`
+- `list/create_col/delete_col/col_info/reset`
+
+因此上层 `Memory` 只调用这些统一方法，不关心底层是 FAISS、Qdrant 还是 Pinecone。
+
+### 3.2 其他能力位也同理
+
+- `LLMBase.generate_response(...)`
+- `EmbeddingBase.embed(...)`
+- `BaseReranker.rerank(...)`
+
+统一接口把“调用姿势”标准化，Factory 把“实现选择”解耦。
+
+---
+
+## 4) 配置系统如何把 provider 转成强类型对象
+
+`MemoryConfig` 聚合了各组件配置；每个子配置都包含：
+
+- `provider`
+- `config`
+
+在 `vector_stores/configs.py` 里，`VectorStoreConfig` 会按 provider 动态导入对应 Pydantic config class 并实例化，等于在启动阶段完成：
+
+- provider 合法性校验
+- 字段校验
+- 默认值补齐（例如 path）
+
+这样 Factory 接收配置时，往往已是合法结构。
+
+---
+
+## 5) 运行时完整案例（真实代码路径）
+
+下面给一个完整案例：
+
+- LLM: `openai`
+- Embedding: `openai`
+- Vector Store: `faiss`
+- Graph: `memgraph`
+- Reranker: `cohere`
+
+```python
+from mem0 import Memory
+
+config = {
+    "llm": {
+        "provider": "openai",
+        "config": {"model": "gpt-4.1-mini"}
+    },
+    "embedder": {
+        "provider": "openai",
+        "config": {"model": "text-embedding-3-small", "embedding_dims": 1536}
+    },
+    "vector_store": {
+        "provider": "faiss",
+        "config": {"collection_name": "mem0_demo", "path": "/tmp/mem0_demo"}
+    },
+    "graph_store": {
+        "provider": "memgraph",
+        "config": {
+            "url": "bolt://localhost:7687",
+            "username": "memgraph",
+            "password": "memgraph"
+        }
+    },
+    "reranker": {
+        "provider": "cohere",
+        "config": {"model": "rerank-v3.5"}
+    }
+}
+
+m = Memory.from_config(config)
+```
+
+### 初始化发生了什么（step-by-step）
+
+1. `Memory.from_config()` 触发 `MemoryConfig` 校验。
+2. `EmbedderFactory.create("openai", ...)` -> `OpenAIEmbedding`。
+3. `VectorStoreFactory.create("faiss", ...)` -> `FAISS`。
+4. `LlmFactory.create("openai", ...)` -> `OpenAILLM`。
+5. `RerankerFactory.create("cohere", ...)` -> `CohereReranker`。
+6. `GraphStoreFactory.create("memgraph", ...)` -> Memgraph 的 `MemoryGraph`。
+
+上面每一步都可替换 provider，但 `Memory` 代码不变。
+
+---
+
+## 6) 推理式演示：一次 `add` + 一次 `search`
+
+### 6.1 `add(...)`
+
+调用：
+
+```python
+m.add(
+    [{"role": "user", "content": "我每周三去打网球"}],
+    user_id="u_1",
+)
+```
+
+关键流程：
+
+1. `_build_filters_and_metadata` 生成 `metadata/filters`（含 `user_id`）。
+2. `parse_messages` 规整文本。
+3. `llm.generate_response(...)` 提取事实（若 `infer=True`）。
+4. 对每条新事实 `embedding_model.embed(..., "add")`。
+5. `vector_store.search(...)` 做近邻查重。
+6. 再走一次 `llm.generate_response(...)` 决策 ADD/UPDATE/DELETE。
+7. 最终调用 `vector_store.insert/update/delete`。
+8. 若启用图谱，并行执行 `graph.add(...)`。
+
+### 6.2 `search(...)`
+
+调用：
+
+```python
+m.search("他平时做什么运动？", user_id="u_1", rerank=True)
+```
+
+关键流程：
+
+1. `embedding_model.embed(query, "search")`
+2. `vector_store.search(query=..., vectors=..., filters=...)`
+3. 组装 `MemoryItem` 输出
+4. 若 `rerank=True` 且启用 reranker：`reranker.rerank(query, docs, top_k)`
+5. 若启用 graph：并发返回 `relations`
+
+---
+
+## 7) ANSI Art 时序图（Factory + 抽象层联动）
+
+```ansi
+┌──────────────┐     ┌────────────┐     ┌───────────────────────┐
+│  App / User  │     │   Memory   │     │    *Factory Layer     │
+└──────┬───────┘     └─────┬──────┘     └──────────┬────────────┘
+       │  Memory.from_config(cfg) │                 │
+       ├──────────────────────────>                 │
+       │                           │ create(llm)    │
+       │                           ├────────────────> LlmFactory
+       │                           │ create(embed)  │
+       │                           ├────────────────> EmbedderFactory
+       │                           │ create(vdb)    │
+       │                           ├────────────────> VectorStoreFactory
+       │                           │ create(graph)  │
+       │                           ├────────────────> GraphStoreFactory
+       │                           │ create(rerank) │
+       │                           └────────────────> RerankerFactory
+       │
+       │ add(messages)             │
+       ├──────────────────────────>│
+       │                           │ llm.generate_response()        ┌──────────────────────┐
+       │                           ├────────────────────────────────>│ LLMBase impl (OpenAI)│
+       │                           │ embed("add")                  └──────────────────────┘
+       │                           ├────────────────────────────────> EmbeddingBase impl
+       │                           │ search/insert/update/delete
+       │                           ├────────────────────────────────> VectorStoreBase impl
+       │                           │ graph.add (optional)
+       │                           ├────────────────────────────────> Graph impl
+       │                           │
+       │ search(query, rerank=True)│
+       ├──────────────────────────>│
+       │                           │ embed("search")
+       │                           ├────────────────────────────────> EmbeddingBase impl
+       │                           │ vector_store.search()
+       │                           ├────────────────────────────────> VectorStoreBase impl
+       │                           │ reranker.rerank() (optional)
+       │                           ├────────────────────────────────> BaseReranker impl
+       │<──────────────────────────┤ results(+relations)
+```
+
+---
+
+## 8) 为什么这个设计能支撑“大量后端”
+
+一句话总结：
+
+- **新增后端 = 新实现类 + 工厂注册 + 配置类（可选）**
+- **上层业务流程基本不动**
+
+所以 Mem0 能在 LLM、Embedding、VectorStore、Graph、Reranker 五个维度同时扩展，并保持主流程稳定。
+
+如果你愿意，我下一步可以补一篇「手把手新增一个自定义 VectorStore provider（含最小可运行实现 + 测试）」的文档。
