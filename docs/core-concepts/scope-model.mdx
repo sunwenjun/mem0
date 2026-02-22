@@ -1,0 +1,147 @@
+---
+title: 作用域模型（user_id / agent_id / run_id）
+description: Mem0 如何通过统一的 ID 过滤与元数据机制实现会话隔离。
+---
+
+## 为什么需要这套模型
+
+Mem0 使用统一的作用域模型，避免不同会话、不同身份之间的记忆串线。核心原则是：
+
+- `user_id`、`agent_id`、`run_id` 都被视为**会话作用域 ID**。
+- 作用域相关操作中，至少要提供其中一个。
+- 同一组 ID 会同时用于：
+  - 写入时的 **metadata**
+  - 查询时的 **filters**
+
+这套行为被集中到 `_build_filters_and_metadata(...)` 中，因此各 API 路径可以保持一致。
+
+## 核心实现
+
+在 `mem0/memory/main.py` 中，`_build_filters_and_metadata(...)` 会：
+
+1. 先以调用方传入的 `input_metadata`、`input_filters` 为基础。
+2. 将传入的作用域 ID（`user_id`、`agent_id`、`run_id`）同时写入：
+   - `base_metadata_template`（用于存储）
+   - `effective_query_filters`（用于检索 / 列表）
+3. 校验至少存在一个作用域 ID，否则抛出 `Mem0ValidationError`。
+4. 解析 `actor_id`，仅用于查询阶段的额外收敛。
+
+这样就形成了“作用域处理单一事实来源（single source of truth）”。
+
+## CRUD API 如何复用这套模型
+
+### Add
+
+`add(...)` 会先调用 `_build_filters_and_metadata(..., input_metadata=metadata)`，然后用返回的 `processed_metadata` 写入记忆；后续检索/更新相关逻辑使用 `effective_filters`。
+
+### Search / Get All
+
+`search(...)` 与 `get_all(...)` 会调用 `_build_filters_and_metadata(..., input_filters=filters)`，并把结果传给向量库/图存储，因此读取范围与写入范围天然一致。
+
+### Delete All
+
+`delete_all(...)` 也遵循同样的作用域思想（基于 ID 组装删除过滤，并拒绝“无作用域全量删除”），只会删除匹配作用域的记录。
+
+## 完整案例（逐步推理）
+
+假设一个多智能体应用：
+
+- `user_id = "u_alice"`
+- `agent_id = "a_support_bot"`
+- `run_id = "r_2026_02_21_001"`
+
+### 第 1 步：写入记忆
+
+调用：
+
+```python
+memory.add(
+  [{"role": "user", "content": "我喜欢无糖拿铁"}],
+  user_id="u_alice",
+  agent_id="a_support_bot",
+  run_id="r_2026_02_21_001",
+  metadata={"channel": "wechat"}
+)
+```
+
+`_build_filters_and_metadata(...)` 返回：
+
+```python
+processed_metadata = {
+  "channel": "wechat",
+  "user_id": "u_alice",
+  "agent_id": "a_support_bot",
+  "run_id": "r_2026_02_21_001"
+}
+
+effective_filters = {
+  "user_id": "u_alice",
+  "agent_id": "a_support_bot",
+  "run_id": "r_2026_02_21_001"
+}
+```
+
+结果：写入的 memory payload 会带上这三个作用域 ID。
+
+### 第 2 步：在同一作用域检索
+
+```python
+memory.search(
+  "咖啡偏好",
+  user_id="u_alice",
+  agent_id="a_support_bot",
+  run_id="r_2026_02_21_001"
+)
+```
+
+只会返回同时匹配这些 ID 的记忆，从而避免混入：
+
+- 其他用户（`user_id != u_alice`）
+- 其他 agent（`agent_id != a_support_bot`）
+- 其他 run（`run_id != r_2026_02_21_001`）
+
+### 第 3 步：用 actor_id 进一步收敛（查询时）
+
+```python
+memory.search(
+  "咖啡偏好",
+  user_id="u_alice",
+  run_id="r_2026_02_21_001",
+  filters={"actor_id": "assistant"}
+)
+```
+
+`actor_id` 会加入 `effective_query_filters`，但 `_build_filters_and_metadata(...)` 不会把它注入基础写入 metadata。
+
+### 第 4 步：安全保护
+
+如果直接调用 `search("咖啡偏好")` 且不提供任何作用域 ID，Mem0 会抛出校验错误，而不是执行无作用域检索。
+
+## ANSI Art 时序图
+
+```text
++---------+        +-------------------------------+        +------------------+
+| Client  |        | _build_filters_and_metadata() |        | Vector/Graph DB  |
++----+----+        +---------------+---------------+        +--------+---------+
+     |                             |                                 |
+     | add(messages, user_id, ...) |                                 |
+     +---------------------------->|                                 |
+     |                             | 合并 input_metadata/filters      |
+     |                             | + 注入 user/agent/run IDs        |
+     |                             | + 校验至少一个作用域 ID           |
+     |                             | 返回 (metadata, filters)         |
+     |<----------------------------+                                 |
+     |                                                              |
+     | store(memory, metadata[user/agent/run/...])                  |
+     +------------------------------------------------------------->|
+     |                                                              |
+     | search(query, user_id, agent_id, run_id, filters?)           |
+     +---------------------------->|                                 |
+     |                             | 重建 effective_filters          |
+     |                             | + 可选 actor_id 解析            |
+     |<----------------------------+                                 |
+     | query(filters=user/agent/run[/actor])                        |
+     +------------------------------------------------------------->|
+     |<-------------------------------------------------------------+
+     |        仅返回作用域内结果（避免跨会话串线）                   |
+```
