@@ -1,0 +1,288 @@
+---
+title: Prompt 即记忆治理：事实提取与 ADD/UPDATE/DELETE/NONE 全流程
+sidebarTitle: Prompt Memory Governance
+description: 从代码实现视角拆解 Mem0 的提示词治理策略，包含完整案例与逐步推理。
+---
+
+## 核心结论（先看）
+
+在 Mem0 里，**“记忆治理”并不只发生在向量检索或数据库层**，而是由两层 Prompt 联合决定：
+
+1. **事实提取 Prompt**：决定“候选事实池”里有什么（即“记住什么”）。
+2. **更新决策 Prompt（ADD/UPDATE/DELETE/NONE）**：决定候选事实如何作用到已有记忆（即“怎么改”）。
+
+两层都可通过配置覆盖（`custom_fact_extraction_prompt`、`custom_update_memory_prompt`），因此策略本身是可编排、可版本化的。 
+
+---
+
+## 代码里这条治理链路怎么落地
+
+### 1) `add()` 入口：先标准化，再决定是否走推理治理
+
+`Memory.add()` 在 `infer=True`（默认）时会触发“提取 + 决策 + 执行”三段式流程；`infer=False` 时直接入库，跳过治理推理。也就是说，提示词治理的开关就是 `infer`。 
+
+### 2) 事实提取阶段：用户记忆 vs 助手记忆
+
+- `parse_messages()` 先把对话展平成带角色前缀的字符串（`system/user/assistant:`）。
+- `_should_use_agent_memory_extraction()` 判断是否走“助手记忆提取”：当且仅当 `agent_id` 存在且消息中有 `assistant` 角色。
+- `get_fact_retrieval_messages()` 根据该布尔值选择：
+  - `USER_MEMORY_EXTRACTION_PROMPT`
+  - `AGENT_MEMORY_EXTRACTION_PROMPT`
+
+这一步决定了抽取边界：
+
+- 用户提取 Prompt 明确强调**只允许基于 user 消息**抽取事实。
+- 助手提取 Prompt 明确强调**只允许基于 assistant 消息**抽取事实。
+
+因此，“同一段对话”在不同 metadata 下会得到不同候选事实集。 
+
+### 3) 记忆检索与对齐：把候选事实映射到旧记忆上下文
+
+对每条新事实，系统会：
+
+1. 生成 embedding；
+2. 在当前作用域（`user_id/agent_id/run_id`）检索相似旧记忆；
+3. 聚合去重后，构造旧记忆列表。
+
+随后用“临时数字 ID -> 真实 UUID”映射避免模型在 UUID 上幻觉：传给模型的是 `0/1/2...`，落库时再回填真实 ID。这个设计让 UPDATE/DELETE 更稳。 
+
+### 4) 更新决策 Prompt：ADD/UPDATE/DELETE/NONE 的治理规则
+
+`get_update_memory_messages()` 会把以下三部分拼接给模型：
+
+1. 更新规则 Prompt（默认或自定义）；
+2. 当前旧记忆（可能为空）；
+3. 新提取事实。
+
+并强制 JSON 输出结构，`event` 必须是 `ADD/UPDATE/DELETE/NONE`。 
+
+### 5) 执行层：把 event 翻译成真实存储操作
+
+- `ADD` -> `_create_memory(...)`
+- `UPDATE` -> `_update_memory(...)`
+- `DELETE` -> `_delete_memory(...)`
+- `NONE` -> 不改文本；若携带会话标识（`agent_id/run_id`），则只更新 payload 元数据
+
+这说明 LLM 只负责“治理决策”，最终落库动作仍是显式代码分支执行。 
+
+---
+
+## 完整案例：一步一步推理演示
+
+> 场景：同一用户先后表达“喜欢奶酪披萨”→“也喜欢鸡肉披萨”→“现在不吃乳制品”。
+
+### Step 0：初始状态
+
+- 旧记忆：`[]`
+- 新对话：`"我喜欢奶酪披萨"`
+
+### Step 1：事实提取
+
+在用户提取 Prompt 下，候选事实可能是：
+
+```json
+{"facts": ["喜欢奶酪披萨"]}
+```
+
+### Step 2：更新决策
+
+输入：
+- 旧记忆为空
+- 新事实：`["喜欢奶酪披萨"]`
+
+输出（示意）：
+
+```json
+{
+  "memory": [
+    {"id": "0", "text": "喜欢奶酪披萨", "event": "ADD"}
+  ]
+}
+```
+
+### Step 3：执行
+
+执行 `ADD`，创建真实记忆 UUID（例如 `a1b2...`）。
+
+---
+
+### Step 4：第二轮对话
+
+新对话：`"我也喜欢鸡肉披萨"`
+
+#### 4.1 事实提取
+
+```json
+{"facts": ["喜欢鸡肉披萨"]}
+```
+
+#### 4.2 旧记忆检索
+
+检索到近邻：`[{id: a1b2..., text: "喜欢奶酪披萨"}]`，映射成临时 ID `0` 交给更新 Prompt。
+
+#### 4.3 更新决策
+
+模型可能判定为“互补信息，建议融合更新”：
+
+```json
+{
+  "memory": [
+    {
+      "id": "0",
+      "text": "喜欢奶酪和鸡肉披萨",
+      "event": "UPDATE",
+      "old_memory": "喜欢奶酪披萨"
+    }
+  ]
+}
+```
+
+#### 4.4 执行
+
+执行 `UPDATE`，保持同一真实 UUID，仅更新文本。
+
+---
+
+### Step 5：第三轮对话（冲突信息）
+
+新对话：`"我现在乳糖不耐受，不吃任何乳制品"`
+
+#### 5.1 事实提取
+
+```json
+{"facts": ["乳糖不耐受", "不吃乳制品"]}
+```
+
+#### 5.2 更新决策（关键治理点）
+
+相对于旧记忆“喜欢奶酪和鸡肉披萨”：
+
+- “不吃乳制品”与“奶酪偏好”冲突 => 对奶酪相关旧记忆可能 `DELETE` 或 `UPDATE` 成更精确表述。
+- “乳糖不耐受”是新增健康约束 => `ADD`。
+
+一种合理输出：
+
+```json
+{
+  "memory": [
+    {"id": "0", "text": "喜欢奶酪和鸡肉披萨", "event": "DELETE"},
+    {"id": "1", "text": "乳糖不耐受", "event": "ADD"},
+    {"id": "2", "text": "不吃乳制品", "event": "ADD"}
+  ]
+}
+```
+
+#### 5.3 执行结果
+
+- 原偏好被删除
+- 新约束被加入
+
+最终系统“记住什么、怎么改”完全由提示词规则 + 检索上下文共同决定。
+
+---
+
+## 这套实现的治理特性（工程视角）
+
+1. **策略前移**：在写库前由 Prompt 做治理，而不是写后清洗。  
+2. **双层裁决**：先抽事实，再做事件决策，降低“直接端到端写库”风险。  
+3. **作用域一致性**：检索与更新都受 `user_id/agent_id/run_id` 过滤。  
+4. **可定制策略**：两个 Prompt 都可配置替换，便于按行业做“记忆法典”。  
+5. **执行可控**：LLM 不直接操作数据库，事件由代码分支执行。  
+
+---
+
+## 关键问题：LLM 到底如何区分 `ADD` 和 `UPDATE`？
+
+你提到的两个例子非常关键，本质是：
+
+- **并存偏好（multi-value preference）**：喜欢 A，后来又喜欢 B，通常应并存；
+- **单槽位偏好（single-slot preference）**：原来喜欢小米汽车，后来喜欢 Tesla，可能是“替换”。
+
+在当前实现里，这个区分不是硬编码规则，而是由**更新决策 Prompt + 检索到的旧记忆上下文**共同决定：
+
+1. 系统把新事实和检索到的旧记忆一起交给更新 LLM。  
+2. 更新 LLM 根据 Prompt 中“语义相同/冲突/补充”的描述，输出 `ADD`、`UPDATE`、`DELETE` 或 `NONE`。  
+3. 代码只负责执行，不再二次推理。
+
+换句话说：**“是并存还是替换”主要取决于 Prompt 的策略表达是否足够清晰**。如果 Prompt 没有定义“槽位冲突规则”，模型可能在边界场景不稳定。
+
+### 例子 A：`喜欢A` -> `喜欢B`（通常并存）
+
+当两条偏好可并存（例如音乐、电影、菜系等可多值集合）时，模型常见两种行为：
+
+- `ADD` 新条目（A 保留 + B 新增）；
+- `UPDATE` 为聚合表达（“喜欢 A 和 B”）。
+
+二者都不算错误，取决于你的数据建模偏好（离散存储 vs 聚合存储）。
+
+### 例子 B：`喜欢小米汽车` -> `喜欢Tesla`（可能替换）
+
+如果你把“汽车品牌偏好”视为**单槽位**，理想行为通常是：
+
+- `UPDATE`：将同一槽位从“小米”改为“Tesla”；或
+- `DELETE + ADD`：先删旧偏好，再加新偏好。
+
+若 Prompt 未声明这是单槽位，LLM 可能也会当成并存偏好而 `ADD`，这正是你担心的问题。
+
+### 为什么代码层难以自动区分？
+
+当前主流程没有领域本体（ontology）或字段 schema 来声明“哪些偏好可多值、哪些必须单值”；因此系统无法在代码中硬判“车品牌必须替换”。它依赖 Prompt 语义治理。
+
+---
+
+## 如何让区分稳定：给 Update Prompt 增加“槽位冲突规则”
+
+建议在 `custom_update_memory_prompt` 中显式加入以下规则：
+
+1. **多值槽位（ADD 优先）**  
+   例如：爱好、电影、菜系、运动。新值默认并存，除非用户明确否定旧值。
+2. **单值槽位（UPDATE 优先）**  
+   例如：当前首选汽车品牌、当前居住城市、当前职位。新值出现时替换旧值。
+3. **强冲突触发 DELETE/UPDATE**  
+   明确否定词（“不再”“改为”“从 X 换成 Y”“现在只用 Y”）出现时，优先替换/删除旧记忆。
+
+你可以直接把这类规范写进 Prompt（示意）：
+
+```text
+Slot policy:
+- Multi-value slots: hobbies, favorite_food, favorite_movies => prefer ADD or merge-update.
+- Single-value slots: preferred_car_brand, current_city, current_job => prefer UPDATE (replace old value).
+- If user expresses replacement cues ("改为", "换成", "不再", "现在只") => UPDATE or DELETE old conflicting memory.
+```
+
+这样，`喜欢A -> 喜欢B` 与 `喜欢小米汽车 -> 喜欢Tesla` 会按不同槽位策略落到不同 event。
+
+---
+
+## ANSI Art 时序图（端到端）
+
+```text
++--------+        +----------------+        +-------------------+        +-------------+        +--------------+
+| Client |        | Memory.add()   |        | Fact Extract LLM  |        | Update LLM  |        | Vector Store |
++--------+        +----------------+        +-------------------+        +-------------+        +--------------+
+    |                     |                           |                           |                         |
+    | messages+metadata   |                           |                           |                         |
+    |-------------------->| normalize / parse         |                           |                         |
+    |                     | choose USER/AGENT prompt  |                           |                         |
+    |                     |-------------------------->| extract facts(JSON)        |                         |
+    |                     |<--------------------------| {facts:[...]}              |                         |
+    |                     | embed each fact + search old memories                  |                         |
+    |                     |------------------------------------------------------->| (via prompt payload)    |
+    |                     | build update prompt (old+new+rules)                    |                         |
+    |                     |------------------------------------------------------->| decide events           |
+    |                     |<-------------------------------------------------------| {memory:[{event...}]}   |
+    |                     | loop events: ADD/UPDATE/DELETE/NONE                    |                         |
+    |                     |-------------------------------------------------------->| create/update/delete    |
+    |                     |<--------------------------------------------------------| ids / payload updated   |
+    |                     | return applied results                                  |                         |
+    |<--------------------| [{id,memory,event,...}]                                |                         |
+    |                     |                           |                           |                         |
+```
+
+---
+
+## 你可以直接落地的治理建议
+
+- 为不同业务域（客服、医疗、销售）分别版本化两套 Prompt。  
+- 给 UPDATE Prompt 增加“冲突优先级规则”（例如健康约束 > 口味偏好）。  
+- 用离线回放集评测四类事件命中率（ADD/UPDATE/DELETE/NONE），把 Prompt 当策略代码做 CI。  
