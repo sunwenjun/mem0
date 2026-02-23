@@ -1,0 +1,164 @@
+---
+title: 检索流程与元数据过滤源码深度解析
+description: 从 Memory.search 到 vector_store.search 的完整链路、过滤语义、重排与图谱并行的实现细节。
+icon: "route"
+---
+
+## 一句话结论
+
+Mem0 OSS 当前主干检索链路确实是：
+
+`query -> embedding_model.embed(query, "search") -> vector_store.search(..., filters=...) -> threshold -> (optional) rerank -> (optional) graph result merge`。
+
+并且 `AND / OR / NOT + eq/in/contains...` 过滤语法在 `Memory.search` 层会先做“通用格式预处理”，再透传给各个 vector store；**能否完全生效取决于具体向量库实现**。
+
+---
+
+## 1) 主流程在代码里怎么走
+
+在 `Memory.search()`：
+
+1. 先把 `user_id/agent_id/run_id` 与传入 `filters` 合并，形成 `effective_filters`。
+2. 检查是否包含高级过滤操作符（`AND/OR/NOT` 或 `eq/in/contains` 等）。
+3. 如检测到高级操作符，调用 `_process_metadata_filters()` 规整过滤结构。
+4. 并发执行：
+   - `_search_vector_store(query, effective_filters, limit, threshold)`
+   - `graph.search(...)`（仅 `enable_graph=True`）
+5. 向量结果返回后可选执行 rerank（`rerank=True` 且配置了 reranker）。
+6. 最终返回 `{"results": ...}`，若启用图谱则附带 `"relations"`。
+
+---
+
+## 2) “元数据过滤（AND/OR/NOT、eq/in/contains）”到底是什么意思
+
+它是 Mem0 在 **Memory API 层提供的一种统一过滤 DSL（语法层）**，用于表达“语义召回前后要满足的结构化条件”。
+
+### 2.1 支持的语法（Memory.search 接口层）
+
+- 简单等值：`{"key": "value"}`
+- 比较/集合：`eq/ne/gt/gte/lt/lte/in/nin`
+- 字符串：`contains/icontains`
+- 通配：`{"key": "*"}`
+- 逻辑组合：`AND / OR / NOT`
+
+### 2.2 实现方式
+
+`_process_metadata_filters()` 会把上述语法转成“通用中间格式”：
+
+- `AND`: 直接合并到同一层（等价 must）
+- `OR`: 转为 `"$or": [ ... ]`
+- `NOT`: 转为 `"$not": [ ... ]`
+- 字段操作符保持为 `{field: {op: value}}`
+
+然后 `effective_filters.update(processed_filters)` 后交给 `vector_store.search`。
+
+### 2.3 关键现实：各向量库支持度不同
+
+Mem0 统一了“表达层”，但不同 vector store 的 `search(filters=...)` 实现差异很大：
+
+- 有的只做简单等值匹配；
+- 有的支持部分操作符；
+- 有的把 dict 直接透传给底层 SDK（是否支持由底层决定）。
+
+因此你看到的 `AND/OR/NOT/contains` 是 **API 可表达能力**，不是“所有向量库 100% 原生等价支持能力”。
+
+---
+
+## 3) 完整案例（含逐步推理）
+
+我们用下面查询作为示例：
+
+```python
+results = m.search(
+    query="我最近有哪些高优先级且与会议相关的事项？",
+    user_id="u_001",
+    limit=5,
+    threshold=0.7,
+    rerank=True,
+    filters={
+        "AND": [
+            {"priority": {"gte": 8}},
+            {"OR": [
+                {"category": {"in": ["work", "project"]}},
+                {"tags": {"contains": "meeting"}}
+            ]},
+            {"NOT": [
+                {"status": {"eq": "archived"}}
+            ]}
+        ]
+    }
+)
+```
+
+### Step A：构建作用域过滤
+
+`user_id="u_001"` 会被并入 `effective_filters`，确保只在该用户作用域内检索。
+
+### Step B：高级过滤识别与预处理
+
+因为出现了 `AND/OR/NOT/gte/in/contains/eq`，触发 `_has_advanced_operators()`，随后进入 `_process_metadata_filters()`。
+
+> 注意：当前实现中，最外层 `AND` 会被展开合并；而嵌套 `OR/NOT` 的“递归语义”依赖具体数据结构和向量库兼容性，工程上建议优先做扁平化验证。
+
+### Step C：向量召回
+
+进入 `_search_vector_store()`：
+
+- 先 `embedding_model.embed(query, "search")`
+- 再 `vector_store.search(query=query, vectors=embeddings, limit=5, filters=effective_filters)`
+
+得到 top-k 近邻（带 score 与 payload）。
+
+### Step D：阈值过滤
+
+在 Memory 层再执行一次 `threshold`：仅保留 `mem.score >= 0.7`。
+
+### Step E：可选重排
+
+若配置了 reranker（cohere/sentence_transformer/llm 等）且 `rerank=True`，则对当前候选再排序。
+
+### Step F：可选图谱并行返回
+
+若 `enable_graph=True`，图检索与向量检索并发，最终返回：
+
+```json
+{
+  "results": [...],
+  "relations": [...]
+}
+```
+
+---
+
+## 4) ANSI Art 时序图
+
+```ansi
++-------------+        +------------------+        +----------------+        +----------------+        +----------------+
+|   Caller    |        |  Memory.search   |        | EmbeddingModel |        |  VectorStore   |        |    Reranker    |
++-------------+        +------------------+        +----------------+        +----------------+        +----------------+
+       |                        |                            |                         |                          |
+       | query, filters, ids    |                            |                         |                          |
+       |----------------------->|                            |                         |                          |
+       |                        | build effective_filters    |                         |                          |
+       |                        | detect/process AND/OR/NOT  |                         |                          |
+       |                        |--------------------------->| embed(query,"search")  |                          |
+       |                        |<---------------------------| embedding vector         |                          |
+       |                        |------------------------------------------------------>| search(top_k,filters)   |
+       |                        |<------------------------------------------------------| hits(score,payload)      |
+       |                        | threshold(score>=t)        |                         |                          |
+       |                        |------------------------------------------------------>| (optional graph in parallel)
+       |                        | if rerank=True and configured ------------------------------------------------->|
+       |                        |<--------------------------------------------------------------------------------|
+       |                        | merge results (+relations if graph enabled)                                   |
+       |<-----------------------| final response                                                                  |
+       |                        |                                                                                 |
+```
+
+---
+
+## 5) 实战建议
+
+1. **先确认向量库的 filter 方言**（是否支持 `$or/$not/contains` 等）。
+2. 对复杂逻辑先做最小可复现实验（逐层增加条件）。
+3. `threshold` 与 `rerank` 的顺序是“先阈值后重排”，调参时注意召回-精排平衡。
+4. 若启用图谱，结果语义是“向量记忆 + 图关系并行返回”，消费侧要做融合策略。
