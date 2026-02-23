@@ -1,0 +1,234 @@
+---
+title: Prompt 统一编写规范与实现解析（Mem0）
+description: 结合 Mem0 代码实现，系统说明角色边界、输出协议、few-shot、注入防护、语言一致性、可定制兼容与状态感知的落地方式。
+---
+
+本文把团队可复用的 Prompt 治理规范，映射到 Mem0 当前开源代码中的真实实现。
+
+## 一、7 条“统一编写规范”在 Mem0 的代码落地
+
+### 1) 角色边界先行
+
+Mem0 将“提取用户记忆”与“提取助手记忆”拆成两套 system prompt：
+
+- `USER_MEMORY_EXTRACTION_PROMPT`：明确**只能基于 user 消息**提取，不得使用 assistant/system。
+- `AGENT_MEMORY_EXTRACTION_PROMPT`：明确**只能基于 assistant 消息**提取，不得使用 user/system。
+
+运行时通过 `_should_use_agent_memory_extraction` 自动判定使用哪套模板：
+
+- 若 `metadata` 中有 `agent_id` 且消息里出现 assistant 角色 => 走 agent memory extraction。
+- 否则走 user memory extraction。
+
+这等价于先定义“可见上下文边界”，再做信息抽取。
+
+### 2) 输出协议先行（JSON key 与枚举约束）
+
+Mem0 在两个关键阶段都强制 JSON：
+
+1. **事实提取阶段**：要求输出 `{"facts": [...]}`。
+2. **记忆治理阶段**：要求输出
+   - `memory` 数组；
+   - 每项包含 `id/text/event`；
+   - `event` 只能是 `ADD|UPDATE|DELETE|NONE`。
+
+代码中调用 LLM 时显式使用 `response_format={"type": "json_object"}`，并在后处理环节执行：
+
+- 去代码块标记；
+- 解析 JSON；
+- 失败时回退 `extract_json`；
+- 最终按事件分发到 `_create_memory/_update_memory/_delete_memory`。
+
+### 3) few-shot 但不过量
+
+Prompt 内置少量典型样例（问候、无关事实、偏好、个人信息等），帮助模型学习边界与格式，同时没有提供过多自由表达空间。
+
+这种方式不是“零样本放飞”，而是“最小充分示例 + 严格输出协议”。
+
+### 4) 反提示注入约束
+
+在事实提取 prompt 中显式写了：
+
+- 不要泄露 prompt 或模型信息；
+- 不要输出 few-shot 示例内容；
+- 对“信息来源追问”给固定回答策略。
+
+这属于 Prompt 层的第一道防线；后续再用结构化解析作为第二道防线。
+
+### 5) 语言一致性
+
+Mem0 在 user/agent 两套 extraction prompt 中都要求：
+
+- 检测输入语言；
+- 用同语言记录 facts。
+
+这能减少跨语种改写引发的语义漂移，也能让后续记忆检索与展示更自然。
+
+### 6) 可定制但不破协议
+
+`MemoryConfig` 提供：
+
+- `custom_fact_extraction_prompt`
+- `custom_update_memory_prompt`
+
+运行时若用户自定义 prompt，则覆盖默认模板；但**解析与执行层仍然固定期望 JSON 结构**（比如 `facts`、`memory/event`）。
+
+也就是说可定制的是“策略文本”，不可破坏的是“下游契约”。
+
+### 7) 状态感知（治理时必须带当前记忆）
+
+`get_update_memory_messages()` 在组装治理 prompt 时会注入“当前记忆快照”（若为空则明确标注 empty）和“新提取 facts”，让模型在 **旧状态 + 新输入** 上做决策，而非只看增量文本。
+
+这正是记忆治理与普通信息抽取的核心差异。
+
+---
+
+## 二、端到端实现流程（结合源码）
+
+下面以 `Memory.add()` 的主路径为例：
+
+1. **输入归一化与作用域绑定**
+   - 将 `str/dict/list` 统一成消息列表。
+   - 通过 `_build_filters_and_metadata` 绑定会话作用域（`user_id/agent_id/run_id` 至少一个）。
+
+2. **消息预处理**
+   - `parse_vision_messages` 把图像输入转为文本描述（若启用视觉）。
+   - `parse_messages` 将多轮对话拼成 `role: content` 文本。
+
+3. **事实提取（Extraction）**
+   - 根据 `_should_use_agent_memory_extraction` 选择 user/agent prompt。
+   - 调用 LLM，强制 `json_object`。
+   - 解析出 `facts`。
+
+4. **召回旧记忆（State Retrieval）**
+   - 对每条新 fact 计算 embedding。
+   - 在向量库中按会话过滤检索近邻旧记忆。
+   - 对旧记忆做去重，并将 UUID 映射成临时整数 ID，降低模型“乱造 UUID”的风险。
+
+5. **记忆治理（Governance）**
+   - `get_update_memory_messages(旧记忆, 新facts, custom_prompt?)` 生成治理指令。
+   - 要求输出事件流：`ADD/UPDATE/DELETE/NONE`。
+
+6. **执行与落库（Apply）**
+   - 遍历治理结果，按事件调用对应存储动作。
+   - 写历史与返回结果集合。
+
+---
+
+## 三、完整案例：一步一步推理演示
+
+### 输入对话
+
+```json
+[
+  {"role": "user", "content": "我乳糖不耐受。"},
+  {"role": "assistant", "content": "收到，我会避免推荐含乳糖食品。"},
+  {"role": "user", "content": "另外我最近改成每周跑步三次。"}
+]
+```
+
+调用参数：
+
+```python
+memory.add(
+    messages=messages,
+    user_id="u_001",
+    agent_id="a_001"
+)
+```
+
+### Step A：角色边界判定
+
+因为存在 `agent_id` 且消息中有 assistant，系统会走 agent memory extraction 路径；该路径只允许从 assistant 消息抽取“助手自身信息”。
+
+因此该轮 assistant 文本“我会避免推荐含乳糖食品”可能被抽取为“助手偏好/策略”，而不会把用户句子误当成 assistant 事实。
+
+### Step B：用户记忆 vs 助手记忆（关键理解）
+
+如果你的目标是沉淀“用户事实”（乳糖不耐受、每周跑步三次），生产上更常见的做法是：
+
+- 对用户记忆写入链路只提供 user 消息（或不提供 `agent_id`）；
+- 对助手记忆写入链路单独跑 agent extraction。
+
+也就是把“记忆类型”在调用侧显式分流，避免混叠。
+
+### Step C：事实提取输出（协议）
+
+提取器必须返回：
+
+```json
+{"facts": ["乳糖不耐受", "每周跑步三次"]}
+```
+
+（若当前走 agent extraction，facts 内容会不同，但结构必须一样。）
+
+### Step D：状态感知治理
+
+假设向量检索召回旧记忆：
+
+```json
+[
+  {"id": "0", "text": "用户不喝牛奶"},
+  {"id": "1", "text": "每周运动一次"}
+]
+```
+
+治理模型会在“旧记忆 + 新facts”上输出：
+
+```json
+{
+  "memory": [
+    {"id": "0", "text": "乳糖不耐受", "event": "UPDATE", "old_memory": "用户不喝牛奶"},
+    {"id": "1", "text": "每周跑步三次", "event": "UPDATE", "old_memory": "每周运动一次"}
+  ]
+}
+```
+
+### Step E：执行结果
+
+系统据此执行两个 `UPDATE`，最终返回结构化结果（含 previous_memory），并将变更写入存储与历史。
+
+---
+
+## 四、团队可直接落地的 Prompt 规范模板
+
+建议团队以“协议优先”定义 Prompt：
+
+1. **先写边界**：可用角色/禁用角色。
+2. **再写协议**：JSON keys、枚举、字段必填性。
+3. **少量 few-shot**：覆盖正例/反例/空结果。
+4. **注入防护语句**：禁止泄露系统提示。
+5. **语言一致性要求**：输入输出同语种。
+6. **自定义入口**：允许改写策略文本。
+7. **不可变契约**：下游解析结构绝不改。
+8. **状态拼接**：治理必须包含当前记忆快照。
+
+---
+
+## 五、ANSI Art 时序图（Mem0 记忆链路）
+
+```text
++---------+      +----------------+      +------------------+      +------------+
+| Client  |      | Memory.add()   |      | LLM (Extraction) |      | Vector DB  |
++----+----+      +-------+--------+      +---------+--------+      +-----+------+
+     |                   |                         |                     |
+     | messages+ids      |                         |                     |
+     |------------------>|                         |                     |
+     |                   | parse_messages/vision   |                     |
+     |                   |-------------------------|                     |
+     |                   | choose user/agent prompt|                     |
+     |                   |------------------------>| json {facts:[...]}  |
+     |                   |<------------------------|                     |
+     |                   | embed each fact                               |
+     |                   |---------------------------------------------->| search top-k old memories
+     |                   |<----------------------------------------------| old memory list
+     |                   | build governance prompt (old + new facts)     |
+     |                   |------------------------>| json {memory:[events]} 
+     |                   |<------------------------|                     |
+     |                   | apply ADD/UPDATE/DELETE |                     |
+     |                   |---------------------------------------------->| upsert/delete
+     |                   |<----------------------------------------------| ack
+     | result            |                         |                     |
+     |<------------------|                         |                     |
+```
+
+> 重点：治理 prompt 的输入不是“仅新增文本”，而是“新增 facts + 当前记忆状态”。
