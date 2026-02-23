@@ -1,0 +1,169 @@
+---
+title: "Retrieval Pipeline Internals"
+description: "Mem0 OSS 中 query -> embedding -> vector search -> threshold -> rerank 的代码级实现解析"
+icon: "diagram-project"
+---
+
+# Mem0 检索召回链路（代码级）
+
+本文聚焦 **Mem0 Open Source 当前“实际在用”** 的召回路径，严格对应代码里的执行顺序：
+
+`query -> embedding_model.embed(query, "search") -> vector_store.search(top-k, filters) -> threshold(可选) -> rerank(可选)`
+
+## 1) 入口：`Memory.search(...)`
+
+同步入口在 `Memory.search`：
+
+1. 构建并校验作用域过滤条件（`user_id/agent_id/run_id` 至少一个）。
+2. 处理高级 metadata filters（如 `AND/OR/NOT`、`eq/gte/in/...`）。
+3. 并发执行：
+   - `_search_vector_store(query, filters, limit, threshold)`
+   - `graph.search(...)`（若开启 graph）
+4. 对向量召回结果做 rerank（仅在 `rerank=True` 且已配置 reranker 时）。
+5. 返回 `{"results": ...}`，如果开启 graph 则附带 `relations`。
+
+> 注意：graph 搜索是并行附加通道，不改变向量召回主链路。
+
+## 2) 核心召回：`_search_vector_store(...)`
+
+同步版核心逻辑（也是你描述的主流程）就在这里：
+
+```python
+embeddings = self.embedding_model.embed(query, "search")
+memories = self.vector_store.search(
+    query=query,
+    vectors=embeddings,
+    limit=limit,
+    filters=filters,
+)
+```
+
+随后 Mem0 会把向量库返回对象转成统一结构（`id/memory/hash/score/...`），并做 `threshold` 过滤：
+
+- `threshold is None`：不过滤，全部保留。
+- `threshold` 有值：仅保留 `mem.score >= threshold` 的项。
+
+## 3) 可选 rerank：`rerank=True` + `config.reranker`
+
+- `Memory.__init__` 中，如果 `config.reranker` 存在，会通过 `RerankerFactory.create(...)` 实例化重排器。
+- `search(...)` 末尾会在召回结果基础上执行 `self.reranker.rerank(query, original_memories, limit)`。
+- 任意 rerank 异常会降级为“返回原始向量结果”。
+
+因此，**rerank 默认是“开关层”，不是主召回必经层**。
+
+## 4) Async 版本一致性
+
+`AsyncMemory.search(...)` 与同步版逻辑一致，仅将 embedding / vector_search / rerank 包到 `asyncio.to_thread(...)` 或 `asyncio.create_task(...)` 执行，语义不变：
+
+- 仍是 `embed(query, "search")`。
+- 仍是 `vector_store.search(... limit, filters ...)`。
+- 仍是 threshold 后置过滤。
+- 仍是可选 rerank。
+
+## 5) 一个完整案例（从配置到返回）
+
+### 配置示例
+
+```python
+from mem0 import Memory
+
+config = {
+    "vector_store": {
+        "provider": "qdrant",
+        "config": {"collection_name": "mem0"}
+    },
+    "embedder": {
+        "provider": "openai",
+        "config": {"model": "text-embedding-3-small"}
+    },
+    "reranker": {
+        "provider": "cohere",
+        "config": {"model": "rerank-english-v3.0", "top_k": 5}
+    }
+}
+
+m = Memory.from_config(config)
+```
+
+### 查询调用
+
+```python
+resp = m.search(
+    query="我最近更偏好哪种早餐？",
+    user_id="u_42",
+    limit=5,
+    threshold=0.75,
+    rerank=True,
+)
+```
+
+### 推理演示（一步一步）
+
+假设向量库 top-5（按向量相似度）初始返回如下：
+
+1. `"你最近爱吃牛油果吐司"` score=0.91
+2. `"你不太喜欢甜甜圈"` score=0.86
+3. `"你上周买了跑鞋"` score=0.79
+4. `"你喜欢燕麦+酸奶"` score=0.74
+5. `"你计划周末爬山"` score=0.63
+
+**Step A: threshold=0.75**
+
+- 保留 0.91 / 0.86 / 0.79
+- 丢弃 0.74 / 0.63
+
+得到 3 条候选。
+
+**Step B: rerank=True 且已配置 reranker**
+
+- reranker 接收 `query + 3 条候选文本`
+- 可能根据语义相关性重排为：
+  1) 牛油果吐司
+  2) 燕麦+酸奶（若未被 threshold 丢弃则可能更靠前；本例已被丢弃）
+  3) 不喜欢甜甜圈
+
+由于本例阈值已先过滤，最终只能在剩余 3 条里重排。
+
+**Step C: 返回**
+
+最终返回 `{"results": [...]}`（若开启 graph 还会返回 `relations`）。
+
+## 6) 与向量库实现的关系（以 Qdrant 为例）
+
+- `vector_store.search(...)` 是统一接口，不同后端各自落地。
+- 例如 Qdrant 实现里，`filters` 会被转成 `Filter`，并在 `query_points(..., limit=limit)` 中执行。
+- `score` 由向量库返回；Mem0 在上层统一做 threshold 和后处理字段组装。
+
+## 7) 结论（当前项目“实际在用”的召回方法）
+
+1. **主召回永远是向量召回**：`embed(query, "search") + vector_store.search(...)`。
+2. **threshold 是后置过滤**：不参与向量库检索表达式构建（在 `_search_vector_store` 里按 `mem.score` 过滤）。
+3. **rerank 是可选增强层**：需要显式配置 reranker；失败自动降级。
+4. **sync / async 语义一致**：仅执行模型不同，不改变检索逻辑。
+5. **graph 检索是并行补充**：与向量召回并发，不替代主召回。
+
+## 8) ANSI Art 时序图
+
+```text
++---------+      +----------------+      +------------------+      +------------------+      +-----------+
+| Client  |      | Memory.search  |      | Embedding Model  |      |   Vector Store   |      | Reranker  |
++----+----+      +-------+--------+      +---------+--------+      +---------+--------+      +-----+-----+
+     |                   |                         |                         |                     |
+     | search(query,...) |                         |                         |                     |
+     |------------------>|                         |                         |                     |
+     |                   | build/merge filters     |                         |                     |
+     |                   |-------------------------|                         |                     |
+     |                   | embed(query, "search") |                         |                     |
+     |                   |------------------------>|                         |                     |
+     |                   |<------------------------|  embedding vector       |                     |
+     |                   | vector_store.search(embedding, top_k, filters)    |                     |
+     |                   |--------------------------------------------------->|                     |
+     |                   |<---------------------------------------------------| hits(score,payload) |
+     |                   | apply threshold (optional)                         |                     |
+     |                   |------------------------- local filter ------------>| (not remote)        |
+     |                   | if rerank enabled                                  |                     |
+     |                   |--------------------------------------------------------------->| rerank     |
+     |                   |<---------------------------------------------------------------| reordered  |
+     |                   | return {results, relations?}                      |                     |
+     |<------------------|                                                   |                     |
+```
