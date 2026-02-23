@@ -63,6 +63,89 @@ m.search("What are Alice's hobbies?", user_id="alice")
   Always provide at least a `user_id` filter to scope searches to the right user's memories. This prevents cross-contamination between users.
 </Tip>
 
+## Multi-question / multi-fact queries: split or not?
+
+Short answer: **Mem0's current search path does not auto-split one query into multiple sub-queries.** It embeds the full input string once, performs one vector search call, then optionally applies threshold and reranking.
+
+### What the OSS code actually does today
+
+At the core (`Memory.search`):
+
+1. Build effective filters (`user_id`, `agent_id`, `run_id`, plus optional metadata filters).
+2. Call `_search_vector_store(query, filters, limit, threshold)`.
+3. `_search_vector_store` runs `embedding_model.embed(query, "search")` once.
+4. Then it calls `vector_store.search(query=query, vectors=embeddings, limit=limit, filters=filters)` once.
+5. Threshold is applied **after** vector DB returns candidates (`mem.score >= threshold`).
+6. If reranker is configured and `rerank=True`, reranking is applied on returned candidates.
+
+So for a user query like: *"我喜欢意大利菜，下周要去上海，另外我对花生过敏"* Mem0 will search with the full sentence as a single query embedding by default.
+
+### Important contrast with `add`
+
+`add(..., infer=True)` uses an LLM fact extraction step (`facts`) and then processes each fact separately when matching existing memories. In other words:
+
+- **Search path**: single embedding for the full query string.
+- **Add path (infer mode)**: multi-fact extraction, then per-fact lookup/update.
+
+This is why retrieval behavior can feel different from ingestion behavior.
+
+### Practical guidance
+
+- If the question has one dominant intent: pass the full query directly.
+- If the query combines many unrelated intents/facts and you need high recall per intent: split in your application layer and merge/deduplicate results.
+- Keep reranking enabled when you expect broad candidate sets; use threshold to cut low-confidence tails.
+
+### Worked example (step-by-step)
+
+Assume stored memories for `user_id="u1"`:
+
+- `m1`: "用户对花生过敏" (score maybe high for allergy-related intent)
+- `m2`: "用户喜欢意大利菜"
+- `m3`: "用户下周去上海"
+
+Query:
+
+`"我能吃什么？我对花生过敏，而且下周去上海有什么餐厅推荐？"`
+
+Execution:
+
+1. `search(query, user_id="u1", limit=5, threshold=0.65, rerank=True)`
+2. Single embedding is generated for the whole query.
+3. Vector store returns top-k nearest memories under `user_id="u1"`.
+4. Memories below `0.65` are dropped.
+5. Reranker (if configured) reorders remaining memories using the original full query.
+6. Final output may include all three memories, but ranking depends on embedding model + store similarity + reranker.
+
+If you split client-side into:
+
+- `q1`: "我对花生过敏"
+- `q2`: "下周去上海有什么餐厅推荐"
+
+you often get better per-intent coverage, at cost of 2x retrieval calls and post-merge logic.
+
+### ANSI sequence diagram
+
+```text
++---------+       +----------------+       +------------------+       +----------------+
+|  Client |       |  Memory.search |       | Embedding Model  |       |  Vector Store  |
++---------+       +----------------+       +------------------+       +----------------+
+     |                    |                         |                          |
+     | query="多问题一句话" |                         |                          |
+     |------------------->|                         |                          |
+     |                    | build filters           |                          |
+     |                    |-------------------------|                          |
+     |                    | embed(query,"search")  |                          |
+     |                    |------------------------>|                          |
+     |                    |<------------------------| embedding vector         |
+     |                    | vector_store.search(...)                           |
+     |                    |--------------------------------------------------->|
+     |                    |<---------------------------------------------------| top-k candidates
+     |                    | apply threshold (score >= threshold)               |
+     |                    | optional rerank(query, candidates)                 |
+     |                    | return results                                     |
+     |<-------------------|                                                    |
+```
+
 ## When should you use it?
 
 - **Context retrieval** - When your agent needs past context to generate better responses
