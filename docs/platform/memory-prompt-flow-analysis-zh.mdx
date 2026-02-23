@@ -1,0 +1,227 @@
+# Mem0 提示词调用全链路分析（语义记忆 / 图记忆 / 过程记忆）
+
+> 本文基于当前 `mem0` 代码库实现，逐层解释你关心的提示词在什么场景下触发、输入如何组装、输出如何被执行，并给出一个完整案例与时序图。
+
+## 1) 语义记忆事实提取层（conversation → facts）
+
+### 涉及提示词
+- `FACT_RETRIEVAL_PROMPT`（legacy）
+- `USER_MEMORY_EXTRACTION_PROMPT`（主路径）
+- `AGENT_MEMORY_EXTRACTION_PROMPT`（agent 画像路径）
+
+### 1.1 调用入口
+语义记忆主入口是 `Memory.add(...)`，并发执行：
+- `_add_to_vector_store(...)`（语义记忆）
+- `_add_to_graph(...)`（图记忆）
+
+在 `_add_to_vector_store(...)` 中会先把多轮 message 拼成字符串（`parse_messages`），再选择事实提取 prompt。
+
+### 1.2 三种提取 prompt 的触发条件
+
+#### A. `USER_MEMORY_EXTRACTION_PROMPT`（默认主路径）
+默认走 `get_fact_retrieval_messages(parsed_messages, is_agent_memory=False)`，即用户画像/用户事实抽取。
+
+**典型条件**：
+- 没有开启 `custom_fact_extraction_prompt`
+- 或者 `agent_id` 不存在
+- 或者有 `agent_id` 但输入消息里没有 assistant role
+
+#### B. `AGENT_MEMORY_EXTRACTION_PROMPT`（agent画像）
+由 `_should_use_agent_memory_extraction(messages, metadata)` 决定，返回逻辑：
+- `metadata` 中有 `agent_id`
+- 且消息里存在 `assistant` 角色
+- 两者都满足才触发 agent prompt
+
+#### C. `FACT_RETRIEVAL_PROMPT`（legacy）
+`get_fact_retrieval_messages_legacy(...)` 仍保留用于向后兼容，但当前主流程 `_add_to_vector_store(...)` 走的是新函数 `get_fact_retrieval_messages(...)`。
+
+### 1.3 覆盖优先级
+如果配置了 `self.config.custom_fact_extraction_prompt`，会直接覆盖上述自动选择逻辑，系统 prompt 不再使用默认的 USER/AGENT 提示词。
+
+---
+
+## 2) 语义记忆治理决策层（facts + old memory → ADD/UPDATE/DELETE/NONE）
+
+### 涉及提示词
+- `DEFAULT_UPDATE_MEMORY_PROMPT`
+- `get_update_memory_messages(...)`
+
+### 2.1 何时触发治理决策
+在事实抽取后拿到 `new_retrieved_facts`，系统会：
+1. 用 embedding 对每条新事实召回近邻旧记忆（vector search）
+2. 把召回结果去重并做临时 ID 映射（防 UUID 幻觉）
+3. 调用 `get_update_memory_messages(...)` 拼装“旧记忆 + 新事实 + 治理规则”的大 prompt
+4. LLM 输出结构化 JSON 决策：`ADD / UPDATE / DELETE / NONE`
+
+若 `new_retrieved_facts` 为空，则跳过此治理调用。
+
+### 2.2 `get_update_memory_messages(...)` 做了什么
+该函数把最终治理输入组装为：
+- 头部：`custom_update_memory_prompt` 或 `DEFAULT_UPDATE_MEMORY_PROMPT`
+- 当前记忆段：
+  - 有旧记忆：嵌入到代码块
+  - 无旧记忆：写明 `Current memory is empty.`
+- 新事实段：三引号包裹 `response_content`
+- 强制输出 JSON schema（memory 列表 + id/text/event/old_memory）
+
+### 2.3 决策执行
+LLM 输出被解析后逐条执行：
+- `ADD` → `_create_memory(...)`
+- `UPDATE` → `_update_memory(...)`（使用旧 ID）
+- `DELETE` → `_delete_memory(...)`
+- `NONE` → 内容不改；若有 `agent_id/run_id`，会补写会话标识到 metadata
+
+---
+
+## 3) 图记忆提取/治理层（text → triples / update / delete）
+
+### 涉及提示词
+- `EXTRACT_RELATIONS_PROMPT`
+- `UPDATE_GRAPH_PROMPT`
+- `DELETE_RELATIONS_SYSTEM_PROMPT`
+
+### 3.1 当前图记忆主流程（`MemoryGraph.add`）
+图记忆在 `Memory.add` 时并发触发 `_add_to_graph(...)`，内部执行：
+1. `_retrieve_nodes_from_data(...)`：先抽实体与类型
+2. `_establish_nodes_relations_from_data(...)`：用 `EXTRACT_RELATIONS_PROMPT` 抽取三元组（source-relationship-destination）
+3. `_search_graph_db(...)`：根据实体向量相似度检索已有关系
+4. `_get_delete_entities_from_search_output(...)`：用 `DELETE_RELATIONS_SYSTEM_PROMPT` 判定需删关系
+5. `_delete_entities(...)` + `_add_entities(...)`：落库
+
+### 3.2 `EXTRACT_RELATIONS_PROMPT` 的调用场景
+在 `_establish_nodes_relations_from_data(...)` 中始终使用：
+- 会把 `USER_ID` 替换成实际“用户身份串”（支持 `user_id + agent_id + run_id`）
+- 若配置了 `graph_store.custom_prompt`，会把它注入 `CUSTOM_PROMPT` 占位
+
+### 3.3 `DELETE_RELATIONS_SYSTEM_PROMPT` 的调用场景
+在 `_get_delete_entities_from_search_output(...)`：
+- 输入是“检索到的现有关系 + 新文本”
+- 输出是建议删除的关系集合
+- 执行时按过滤条件（user/agent/run）精准删除
+
+### 3.4 `UPDATE_GRAPH_PROMPT` 的现状
+`UPDATE_GRAPH_PROMPT` 在 `mem0/graphs/utils.py` 中已定义，但在当前 Python 主流程中**未被实际引用**。当前实现更偏“先抽新关系 + 单独判删 + 最终增删落库”，而不是“显式 UPDATE 指令集”路径。
+
+---
+
+## 4) `PROCEDURAL_MEMORY_SYSTEM_PROMPT`（过程记忆总结）
+
+### 调用条件
+当 `Memory.add(...)` 传入：
+- `memory_type == "procedural_memory"`
+- 且 `agent_id` 存在
+
+则走 `_create_procedural_memory(...)`（同步/异步各一套）。
+
+### 行为特点
+- 输入：完整 messages 历史
+- System prompt：`PROCEDURAL_MEMORY_SYSTEM_PROMPT`（可被入参 `prompt` 覆盖）
+- User 指令：`Create procedural memory of the above conversation.`
+- 输出：高保真步骤总结文本，作为一条 memory 存入向量库（事件视为 ADD）
+
+这条路径**不做** facts 抽取与 ADD/UPDATE/DELETE 治理，而是直接“总结后入库”。
+
+---
+
+## 5) 完整案例：一步一步推演
+
+下面给一个「同一次 `add` 同时触发语义记忆 + 图记忆」的案例。
+
+### 5.1 输入
+- 调用：`Memory.add(messages=..., user_id="u_42", agent_id="a_7")`
+- messages：
+  1. user: "我叫张三，我不吃辣，最喜欢寿司。"
+  2. assistant: "好的，我记住了。"
+  3. user: "下周我要去大阪出差。"
+
+### 5.2 语义记忆层推演
+1. `_should_use_agent_memory_extraction(...)`：
+   - 有 `agent_id`
+   - 有 assistant 消息
+   - ⇒ 选择 `AGENT_MEMORY_EXTRACTION_PROMPT`
+
+2. LLM 抽取 assistant 侧事实：
+   - 由于 assistant 只说“好的，我记住了”，很可能抽不出有效 agent 画像，结果常见是 `facts: []`
+
+3. 因 `new_retrieved_facts` 为空：
+   - 跳过 `get_update_memory_messages(...)`
+   - 本轮语义记忆不新增
+
+> 注意：这体现了“agent 模式”严格只看 assistant 内容。若业务想记用户信息，不能在该场景误触 agent 路径。
+
+### 5.3 图记忆层推演
+1. 实体抽取：`张三 / 寿司 / 大阪 / 出差 / 辣`
+2. 关系抽取（`EXTRACT_RELATIONS_PROMPT`）：可能得到
+   - `u_42 -- name_is -- 张三`
+   - `u_42 -- dislikes_food -- 辣`
+   - `u_42 -- likes_food -- 寿司`
+   - `u_42 -- plans_trip_to -- 大阪`
+3. 检索旧图关系
+4. 删除决策（`DELETE_RELATIONS_SYSTEM_PROMPT`）：
+   - 若旧关系有 `u_42 -- likes_food -- 麻辣火锅`，新信息“我不吃辣”可能触发删除
+5. 执行：删冲突边 + 新增新边
+
+### 5.4 如果改成用户事实路径会怎样？
+如果不传 `agent_id`（或没有 assistant 消息），会走 `USER_MEMORY_EXTRACTION_PROMPT`，语义层会抽到：
+- "我叫张三"
+- "不吃辣"
+- "喜欢寿司"
+- "下周去大阪出差"
+随后进入 `DEFAULT_UPDATE_MEMORY_PROMPT` 治理，输出 ADD/UPDATE/DELETE/NONE 并真正写入向量记忆。
+
+---
+
+## 6) ANSI Art 时序图
+
+```text
++----------------+       +--------------------+       +------------------+       +------------------+
+| Caller / App   |       | Memory.add         |       | Vector Pipeline  |       | Graph Pipeline   |
++----------------+       +--------------------+       +------------------+       +------------------+
+        |                           |                            |                           |
+        | add(messages, ids, ...)   |                            |                           |
+        |-------------------------->|                            |                           |
+        |                           | parse/validate messages    |                           |
+        |                           |--------------------------->|                           |
+        |                           |  (ThreadPool: vector + graph in parallel)              |
+        |                           |==========================================================|
+        |                           |                            |                           |
+        |                           |                            | parse_messages            |
+        |                           |                            | choose USER/AGENT/custom  |
+        |                           |                            | LLM: extract facts        |
+        |                           |                            | if facts empty -> skip     |
+        |                           |                            | else search old memories   |
+        |                           |                            | get_update_memory_messages |
+        |                           |                            | LLM: ADD/UPDATE/DELETE... |
+        |                           |                            | apply to vector store      |
+        |                           |                            |--------------------------->|
+        |                           |                            |                           |
+        |                           |                            |      retrieve entities     |
+        |                           |                            |<---------------------------|
+        |                           |                            |      extract relations     |
+        |                           |                            |<---------------------------|
+        |                           |                            |      search graph similar  |
+        |                           |                            |<---------------------------|
+        |                           |                            |      LLM delete-decision   |
+        |                           |                            |<---------------------------|
+        |                           |                            |      delete/add edges      |
+        |                           |                            |<---------------------------|
+        |                           |==========================================================|
+        |                           | aggregate results (results + relations)                 |
+        |<--------------------------|                                                          |
+
+[Procedural Branch]
+Caller -> Memory.add(memory_type="procedural_memory", agent_id=...)
+Memory.add -> _create_procedural_memory
+_create_procedural_memory -> LLM(PROCEDURAL_MEMORY_SYSTEM_PROMPT)
+_create_procedural_memory -> vector_store.create(ADD summarized history)
+```
+
+---
+
+## 7) 关键结论（可直接用于设计/排障）
+
+1. 语义层事实抽取分三档：legacy（兼容）/ user（主）/ agent（画像）；实际默认主线是 USER/AGENT 动态选择，不是 legacy。
+2. 只要命中 agent 模式，事实来源会严格偏向 assistant 消息，容易导致“用户事实未入库”的表象。
+3. 治理层核心不是写死规则，而是把“旧记忆 + 新事实 + 操作约束”喂给 LLM，由其输出结构化事件后执行。
+4. 图记忆当前是“抽取 + 判删 + 落库”的两阶段治理；`UPDATE_GRAPH_PROMPT` 已定义但未接入 Python 主链路。
+5. 过程记忆（procedural）是独立通道，目标是高保真步骤总结，不参与事实级 ADD/UPDATE/DELETE。
