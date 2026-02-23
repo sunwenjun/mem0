@@ -12,6 +12,86 @@
 
 这就是典型的“**实验 -> 指标 -> 复盘 -> 再实验**”反馈环。它不是只做一次离线实验，而是把 pipeline 固化成可重复运行的工程能力。
 
+### 1.1 三阶段最小示例（用一条问答走完整环）
+
+下面用“同一条 question 在 3 个阶段里如何流动”做一个最小示例：
+
+#### 阶段 1：实验生成结果（`run_experiments.py`）
+
+你运行：
+
+```bash
+python evaluation/run_experiments.py --technique_type rag --chunk_size 500 --num_chunks 1 --output_folder evaluation/results/
+```
+
+会产出类似 `evaluation/results/rag_results_500_k1.json` 的中间结果（示意）：
+
+```json
+{
+  "0": [
+    {
+      "question": "When did I start guitar lessons?",
+      "answer": "March 2021",
+      "category": "2",
+      "context": "...retrieved chunk text...",
+      "response": "March 2021",
+      "search_time": 0.11,
+      "response_time": 0.73
+    }
+  ]
+}
+```
+
+#### 阶段 2：结果评测（`evals.py`）
+
+你运行：
+
+```bash
+python evaluation/evals.py --input_file evaluation/results/rag_results_500_k1.json --output_file evaluation/evaluation_metrics.json
+```
+
+会把每条样本补上 BLEU/F1/LLM judge 打分（示意）：
+
+```json
+{
+  "0": [
+    {
+      "question": "When did I start guitar lessons?",
+      "answer": "March 2021",
+      "response": "March 2021",
+      "category": "2",
+      "bleu_score": 1.0,
+      "f1_score": 1.0,
+      "llm_score": 1
+    }
+  ]
+}
+```
+
+#### 阶段 3：统计汇总（`generate_scores.py`）
+
+你运行：
+
+```bash
+cd evaluation && python generate_scores.py
+```
+
+会把逐条样本聚合成按 category 和 overall 的统计（示意）：
+
+```text
+Mean Scores Per Category:
+         bleu_score  f1_score  llm_score  count
+category
+2           0.8421    0.8014     0.8872    156
+
+Overall Mean Scores:
+bleu_score    0.79xx
+f1_score      0.76xx
+llm_score     0.84xx
+```
+
+这样你就能把“单次实验结果 JSON”转成“可比较的指标画像”，并据此回到第一阶段继续调参。
+
 ---
 
 ## 2. 代码分层：从 Orchestrator 到 Metric 的职责边界
