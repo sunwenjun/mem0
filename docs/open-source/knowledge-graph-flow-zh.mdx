@@ -1,0 +1,263 @@
+# Mem0 当前项目中的知识图谱调用与使用机制（代码级中文解析）
+
+本文基于当前仓库代码，系统说明 Mem0 是如何“开启图谱能力、抽取关系、写入图数据库、检索关系、与向量记忆并行返回”的。
+
+---
+
+## 1. 从入口看：知识图谱并不是单独系统，而是 `Memory` 的可选分支
+
+在 `Memory` 初始化时，`graph_store.config` 只要存在，就会通过 `GraphStoreFactory` 创建图谱实例并设置 `enable_graph=True`。否则图谱分支完全不执行。这样图谱能力是**按配置开关**的。核心点：
+
+- `Memory.__init__`：判断是否启用 graph。
+- `GraphStoreFactory.create`：根据 provider 绑定具体图实现（Neo4j/Memgraph/Neptune/Kuzu）。
+
+也就是说，项目架构上是**向量记忆为主干，图谱为并行增强通道**。
+
+---
+
+## 2. provider 路由：图谱实现如何被选择
+
+`GraphStoreFactory.provider_to_class` 中定义了映射：
+
+- `memgraph -> mem0.memory.memgraph_memory.MemoryGraph`
+- `neptune -> mem0.graphs.neptune.neptunegraph.MemoryGraph`
+- `neptunedb -> mem0.graphs.neptune.neptunedb.MemoryGraph`
+- `kuzu -> mem0.memory.kuzu_memory.MemoryGraph`
+- 默认 `default -> mem0.memory.graph_memory.MemoryGraph`（Neo4j 路径）
+
+因此 `graph_store.provider` 是策略选择器；如果没命中，会落到 default（Neo4j 实现）。
+
+---
+
+## 3. 配置层：何时算“图谱配置有效”
+
+`MemoryConfig` 中含 `graph_store: GraphStoreConfig`。`GraphStoreConfig` 包含：
+
+- `provider`
+- `config`（不同 provider 的连接参数）
+- `llm`（图谱专属 LLM，可覆盖全局 LLM）
+- `custom_prompt`
+- `threshold`（实体 embedding 相似度阈值，默认 0.7）
+
+并通过 validator 对不同 provider 做参数校验（例如 Neo4j 需要 `url/username/password`）。
+
+---
+
+## 4. 添加记忆时，知识图谱是如何被调用的
+
+### 4.1 并行执行入口
+
+在 `Memory.add`（同步）/ `AsyncMemory.add`（异步）流程中，向量写入与图谱写入是并行执行的。图谱分支会调用 `_add_to_graph`。
+
+`_add_to_graph` 做了两件事：
+
+1. 把非 system 消息拼接为纯文本 `data`。
+2. 调用 `self.graph.add(data, filters)`。
+
+---
+
+### 4.2 `self.graph.add(...)` 内部四步（以 Neo4j `graph_memory.py` 为例）
+
+`add(data, filters)` 的主流程：
+
+1. `_retrieve_nodes_from_data`：
+   - 用 LLM + tool(`extract_entities`)抽取实体与实体类型。
+   - 对实体做规范化（小写、空格转下划线）。
+2. `_establish_nodes_relations_from_data`：
+   - 用 `EXTRACT_RELATIONS_PROMPT` + tool(`establish_relationships`)抽取三元组（source/relationship/destination）。
+3. `_search_graph_db`：
+   - 对新实体算 embedding。
+   - 在图中按 `threshold` 召回相似节点，并拉取其入边/出边关系。
+4. `_get_delete_entities_from_search_output` + `_delete_entities` + `_add_entities`：
+   - 先让 LLM 判定哪些旧关系应删除（冲突/过期）。
+   - 再执行关系删除。
+   - 最后 MERGE 新节点/关系，必要时写入节点向量属性。
+
+这体现了“**先比对再更新**”而不是盲目 append。
+
+---
+
+## 5. 搜索与全量读取时，图谱如何参与
+
+### 5.1 `search(query, ...)`
+
+`Memory.search` 会并行执行：
+
+- 向量检索：`_search_vector_store`
+- 图谱检索：`self.graph.search(...)`（仅 `enable_graph=True`）
+
+最终返回：
+
+- 无图谱：`{"results": [...]}`
+- 有图谱：`{"results": [...], "relations": [...]}`
+
+图谱 `search` 的关键：
+
+- 先从 query 抽实体；
+- 再按 embedding + 阈值查相似节点的关联边；
+- 再用 BM25 对关系三元组重排，输出 top 关系。
+
+### 5.2 `get_all(...)`
+
+同样并行：
+
+- 向量侧：全部记忆
+- 图谱侧：`graph.get_all` 返回关系边
+
+结果也包含 `relations` 字段。
+
+---
+
+## 6. 删除时如何保持图谱一致
+
+当执行 `delete_all(...)` 且启用图谱时，会额外调用 `self.graph.delete_all(filters)`，用同一作用域（`user_id/agent_id/run_id`）清理图节点与关系。即向量库和图数据库在会话维度上协同删除。
+
+---
+
+## 7. 完整案例（从输入到输出，逐步推理演示）
+
+下面给一个与代码一致的演示案例。
+
+### 7.1 前置配置（概念）
+
+假设你初始化 `Memory` 时配置：
+
+- `graph_store.provider = "neo4j"`
+- `graph_store.config = {url, username, password, database}`
+- `graph_store.threshold = 0.7`
+
+此时 `Memory.__init__` 会开启 `enable_graph` 并构建 `self.graph`。
+
+### 7.2 第一次写入
+
+输入消息（简化）：
+
+- `"我叫小明，我在阿里云工作，我喜欢篮球。"`
+- `filters/user_id = "u_001"`
+
+**Step A：实体抽取**
+
+LLM 工具抽到（示意）：
+
+- 小明(Person)
+- 阿里云(Organization)
+- 篮球(Sport)
+
+**Step B：关系抽取**
+
+LLM 工具抽到三元组（示意）：
+
+- 小明 -- works_at -- 阿里云
+- 小明 -- likes -- 篮球
+
+**Step C：图中相似实体召回**
+
+因为是首次写入，图中可能无高相似节点，`_search_graph_db` 返回空或很少。
+
+**Step D：删除判定**
+
+`_get_delete_entities_from_search_output` 基本不给删除动作。
+
+**Step E：落库**
+
+`_add_entities` 执行 MERGE：
+
+- 创建/复用节点
+- 节点写 embedding
+- 创建关系 `works_at` / `likes`
+
+返回：`added_entities` 含新增关系。
+
+---
+
+### 7.3 第二次写入（触发关系更新逻辑）
+
+新输入：
+
+- `"我现在在腾讯工作。"`
+- 同样 `user_id = u_001`
+
+**Step A-B** 抽取得到：
+
+- 小明 -- works_at -- 腾讯
+
+**Step C** 召回旧关系时会看到：
+
+- 小明 -- works_at -- 阿里云
+
+**Step D（关键）** 删除判定：
+
+- LLM 根据删除提示词，判断旧雇佣关系被新信息覆盖，产生删除指令。
+
+**Step E** 执行：
+
+- 删除 `小明-works_at-阿里云`
+- 新增 `小明-works_at-腾讯`
+
+结果：图谱体现“最新状态”。
+
+---
+
+### 7.4 查询阶段
+
+查询：`"小明在哪里工作？"`
+
+并行得到两路：
+
+1. `results`：向量记忆文本命中。
+2. `relations`：图关系命中（如 `小明 -- works_at -- 腾讯`）。
+
+上层 agent 可把两路证据拼接生成答案。
+
+---
+
+## 8. 关键实现特征总结（结论）
+
+1. **图谱是可选增强层**：由 `graph_store.config` 决定开关，不影响向量主链路。
+2. **写入采用“抽取-检索-删除-新增”闭环**：避免关系脏增量。
+3. **查询是向量+图谱并行**：返回结构天然支持融合推理。
+4. **作用域过滤一致**：`user_id/agent_id/run_id` 在向量与图谱两侧同时生效。
+5. **provider 可插拔**：工厂模式统一接入多种图后端。
+
+---
+
+## 9. ANSI Art 时序图（端到端）
+
+```text
++---------+      +----------------+      +------------------+      +--------------------+
+| Client  |      |  Memory(main)  |      | MemoryGraph(*)   |      | Graph DB (Neo4j等) |
++----+----+      +--------+-------+      +---------+--------+      +----------+---------+
+     |                    |                        |                           |
+     | add(messages,ids)  |                        |                           |
+     |------------------->|                        |                           |
+     |                    | _add_to_graph(data)    |                           |
+     |                    |----------------------->|                           |
+     |                    |                        | extract_entities (LLM工具) |
+     |                    |                        |--------------------------->|
+     |                    |                        |<---------------------------|
+     |                    |                        | establish_relationships     |
+     |                    |                        |--------------------------->|
+     |                    |                        |<---------------------------|
+     |                    |                        | search similar nodes        |
+     |                    |                        |--------------------------->|
+     |                    |                        |<---------------------------|
+     |                    |                        | decide deletions (LLM工具)  |
+     |                    |                        |--------------------------->|
+     |                    |                        |<---------------------------|
+     |                    |                        | delete + merge relations    |
+     |                    |                        |--------------------------->|
+     |                    |                        |<---------------------------|
+     |                    |<-----------------------| added/deleted entities      |
+     |<-------------------| {results, relations}   |                           |
+     |                    |                        |                           |
+     | search(query,ids)  |                        |                           |
+     |------------------->|                        |                           |
+     |                    | parallel: vector search + graph search             |
+     |                    |----------------------->| graph.search(query,ids)    |
+     |                    |                        |--------------------------->|
+     |                    |                        |<---------------------------|
+     |                    |<-----------------------| top relations              |
+     |<-------------------| {results, relations}   |                           |
+```
+
+> 注：`MemoryGraph(*)` 代表具体 provider 实现（Neo4j/Memgraph/Neptune/Kuzu）。
