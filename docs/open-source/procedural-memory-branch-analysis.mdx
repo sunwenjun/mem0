@@ -1,0 +1,153 @@
+---
+title: 程序性记忆分支解析
+description: "深度解析 memory_type=procedural_memory 在 add() 中的分流、校验与执行路径。"
+icon: "diagram-project"
+iconType: "solid"
+---
+
+# Procedural Memory（程序性记忆）分支能力：代码级完整解析
+
+本文结合当前仓库实现，解释 `memory_type="procedural_memory"` 为什么是从“事实记忆（用户偏好/事实）”迈向“代理技能记忆（行为规则/执行经验）”的关键分叉。
+
+## 1) 核心结论（先看）
+
+- `add()` 在入口只允许一种显式类型：`procedural_memory`；否则直接校验失败。
+- 当且仅当 `agent_id` 存在且 `memory_type == "procedural_memory"` 时，会走专用分支 `_create_procedural_memory(...)`，绕开通用“事实抽取 + 更新决策”流程。
+- 该专用分支会：
+  1. 拼装「程序性总结」系统提示词；
+  2. 让 LLM 生成“按步骤保留执行输出”的过程总结；
+  3. 写入向量库，并在 metadata 中强制打上 `memory_type=procedural_memory`。
+- 若不满足上述条件（例如没传 `agent_id`），即使传了 `memory_type=procedural_memory` 也不会进入程序性分支，会落回普通记忆写入逻辑。
+
+## 2) 代码落点总览
+
+### 2.1 类型定义
+
+`MemoryType` 枚举定义了 `PROCEDURAL = "procedural_memory"`，这是 add 分流时唯一可接受的显式 memory_type 值。
+
+### 2.2 add() 的前置校验
+
+在 `mem0/memory/main.py` 的同步 `add()` 中：
+
+1. 先通过 `_build_filters_and_metadata(...)` 构建 metadata/filter，并要求至少一个作用域 ID（`user_id/agent_id/run_id`）存在。
+2. 校验 `memory_type`：
+   - `None`：允许（默认普通记忆流程）；
+   - `"procedural_memory"`：允许；
+   - 其他值：抛 `Mem0ValidationError`。
+3. 规范化 `messages` 输入（支持 str / dict / list[dict]）。
+
+### 2.3 add() 的关键分流
+
+同步与异步版本都采用同样的分流条件：
+
+- `if agent_id is not None and memory_type == "procedural_memory":`
+  - 进入 `_create_procedural_memory(...)`
+- 否则：
+  - 进入通用向量分支（以及可选图分支）
+
+> 这意味着：`memory_type` 不是单独生效，而是与 `agent_id` 共同构成“程序性分支触发条件”。
+
+### 2.4 程序性记忆创建细节
+
+`_create_procedural_memory(...)`（同步/异步）做了以下事情：
+
+1. 构造 `parsed_messages`：
+   - system: `PROCEDURAL_MEMORY_SYSTEM_PROMPT`
+   - 历史消息: `*messages`
+   - user: `Create procedural memory of the above conversation.`
+2. 调用 LLM 生成程序性总结（并在同步路径去掉代码块包裹）。
+3. metadata 必须存在；随后强制写入：`metadata["memory_type"] = "procedural_memory"`。
+4. 生成 embedding，调用 `_create_memory(...)` 落库，返回 `{results:[...]}`。
+
+## 3) 它和普通“事实记忆”到底差在哪？
+
+### 普通记忆路径（默认）
+
+- 目标：抽取“事实/偏好/关系”并执行 ADD/UPDATE/DELETE 决策。
+- 特征：依赖通用事实抽取 prompt 与历史检索比对，更偏向“用户知识状态”的维护。
+
+### 程序性记忆路径
+
+- 目标：沉淀“代理如何做事”的过程经验（步骤、参数、结果、异常、上下文）。
+- 特征：使用专用系统提示词，强调保留 agent action output 的完整性，更接近可复用的“技能轨迹”。
+
+## 4) 完整案例（端到端）
+
+下面给一个“网页抓取代理”案例，展示从调用到入库的完整路径。
+
+### 4.1 输入
+
+```python
+from mem0 import Memory
+
+memory = Memory()
+
+messages = [
+    {"role": "assistant", "content": "Step1: Opened https://openai.com/blog"},
+    {"role": "assistant", "content": "Step2: Found 10 cards, clicked first card"},
+    {"role": "assistant", "content": "Step3: Extracted title='...' body='...'"},
+]
+
+result = memory.add(
+    messages=messages,
+    agent_id="crawler-agent-01",
+    run_id="run-2026-02-21",
+    memory_type="procedural_memory",
+    metadata={"task": "crawl_openai_blog"},
+)
+print(result)
+```
+
+### 4.2 逐步推理（对照代码）
+
+1. **作用域构建**：`agent_id/run_id/metadata` 被组装为 `processed_metadata`，用于后续存储。
+2. **memory_type 校验通过**：因为值是 `procedural_memory`。
+3. **命中分流条件**：`agent_id` 非空 且 `memory_type=procedural_memory`，进入 `_create_procedural_memory`。
+4. **提示词拼接**：系统注入 `PROCEDURAL_MEMORY_SYSTEM_PROMPT`，末尾追加“Create procedural memory ...”。
+5. **LLM 产出总结**：生成按步骤组织的执行摘要。
+6. **打标签入库**：metadata 中追加 `memory_type=procedural_memory`，embedding 后写入向量存储。
+7. **返回结果**：`{"results": [{"id": "...", "memory": "<procedural summary>", "event": "ADD"}]}`。
+
+### 4.3 两个高频误区
+
+- **误区 A：只传 `memory_type` 不传 `agent_id` 就会进 procedural 分支。**
+  - 实际不会，分流条件要求两者同时满足。
+- **误区 B：`memory_type` 可以传其他自定义值。**
+  - 当前实现不允许，只有 `procedural_memory` 被接受。
+
+## 5) ANSI Art 时序图（add() 程序性记忆分支）
+
+```text
++--------+         +------------------+         +----------------------+         +-----------+         +-------------+
+| 调用方 |         | Memory.add()     |         | _create_procedural   |         | LLM       |         | 向量存储      |
++--------+         +------------------+         +----------------------+         +-----------+         +-------------+
+    |                        |                               |                            |                      |
+    | 调用 add(messages,          |                               |                            |                      |
+    |   agent_id,            |                               |                            |                      |
+    |   memory_type=proc)    |                               |                            |                      |
+    |----------------------->|                               |                            |                      |
+    |                        | 校验作用域ID与memory_type    |                            |                      |
+    |                        | 标准化messages            |                            |                      |
+    |                        | 若 agent_id && procedural -->|                            |                      |
+    |                        |------------------------------>| 组装提示词         |                      |
+    |                        |                               |--------------------------->| 生成总结     |
+    |                        |                               |<---------------------------| 程序性总结文本      |
+    |                        |                               | 设置 metadata.memory_type   |                      |
+    |                        |                               | 向量化(summary)             |                      |
+    |                        |                               |----------------------------------------------->| 写入向量与payload
+    |                        |                               |<-----------------------------------------------| 返回 memory_id            |
+    |                        |<------------------------------| 返回 {results:[ADD]}     |                      |
+    |<-----------------------| 返回响应               |                            |                      |
+    |                        |                               |                            |                      |
+```
+
+## 6) 设计含义：为什么这是 Agent Skill Memory 的关键一步
+
+- 传统“事实记忆”解决的是 **知道什么**（preferences/facts）。
+- 程序性记忆分支解决的是 **怎么做**（action trace + outcome）。
+- 在代理系统中，这让记忆不再只用于个性化回答，而能用于：
+  - 失败恢复（重放上一步输出）；
+  - 多步任务续跑（保留上下文进度）；
+  - 策略迁移（把执行经验复用到下一次相似任务）。
+
+简言之：`memory_type=procedural_memory` + `agent_id` 的分流逻辑，把 Mem0 从“用户事实存储”推进到了“代理技能经验沉淀”。
