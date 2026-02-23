@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from unittest.mock import MagicMock
 
@@ -14,9 +15,7 @@ def _setup_mocks(mocker):
 
     mock_vector_store = mocker.MagicMock()
     mock_vector_store.return_value.search.return_value = []
-    mocker.patch(
-        "mem0.utils.factory.VectorStoreFactory.create", side_effect=[mock_vector_store.return_value, mocker.MagicMock()]
-    )
+    mocker.patch("mem0.utils.factory.VectorStoreFactory.create", return_value=mock_vector_store.return_value)
 
     mock_llm = mocker.MagicMock()
     mocker.patch("mem0.utils.factory.LlmFactory.create", mock_llm)
@@ -127,3 +126,74 @@ class TestAsyncAddToVectorStoreErrors:
         assert result == []
         assert "Empty response from LLM, no memories to extract" in caplog.text
         assert mock_capture_event.call_count == 1
+
+
+class TestSyncAsyncConsistency:
+    @pytest.fixture
+    def memory_pair(self, mocker):
+        _setup_mocks(mocker)
+
+        sync_memory = Memory()
+        async_memory = AsyncMemory()
+
+        for memory in (sync_memory, async_memory):
+            memory.api_version = "v1.1"
+            memory.enable_graph = False
+
+        return sync_memory, async_memory
+
+    def test_search_consistency_between_sync_and_async(self, memory_pair):
+        sync_memory, async_memory = memory_pair
+
+        shared_results = [
+            MagicMock(
+                id="m1",
+                score=0.91,
+                payload={"data": "loves chai", "user_id": "u1", "created_at": "2024", "updated_at": "2024"},
+            )
+        ]
+
+        sync_memory.vector_store.search.return_value = shared_results
+        async_memory.vector_store.search.return_value = shared_results
+
+        sync_result = sync_memory.search("chai", user_id="u1")
+        async_result = asyncio.run(async_memory.search("chai", user_id="u1"))
+
+        assert sync_result == async_result
+
+    def test_get_all_consistency_between_sync_and_async(self, memory_pair):
+        sync_memory, async_memory = memory_pair
+
+        shared_memories = [
+            MagicMock(
+                id="m2",
+                payload={"data": "prefers email", "user_id": "u1", "created_at": "2024", "updated_at": "2024"},
+            )
+        ]
+
+        sync_memory.vector_store.list.return_value = shared_memories
+        async_memory.vector_store.list.return_value = shared_memories
+
+        sync_result = sync_memory.get_all(user_id="u1")
+        async_result = asyncio.run(async_memory.get_all(user_id="u1"))
+
+        assert sync_result == async_result
+
+    @pytest.mark.asyncio
+    async def test_add_infer_false_consistency_between_sync_and_async(self, memory_pair, mocker):
+        sync_memory, async_memory = memory_pair
+
+        mocker.patch.object(sync_memory, "_create_memory", side_effect=["sync-1", "sync-2"])
+        mocker.patch.object(async_memory, "_create_memory", side_effect=["async-1", "async-2"])
+
+        messages = [
+            {"role": "user", "content": "I like cycling", "name": "alice"},
+            {"role": "assistant", "content": "Got it"},
+        ]
+
+        sync_result = sync_memory.add(messages, user_id="u1", infer=False)
+        async_result = await async_memory.add(messages, user_id="u1", infer=False)
+
+        assert [item["memory"] for item in sync_result["results"]] == [item["memory"] for item in async_result["results"]]
+        assert [item["event"] for item in sync_result["results"]] == [item["event"] for item in async_result["results"]]
+        assert [item["role"] for item in sync_result["results"]] == [item["role"] for item in async_result["results"]]

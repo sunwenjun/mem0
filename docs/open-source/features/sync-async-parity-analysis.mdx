@@ -1,0 +1,328 @@
+---
+title: Memory 与 AsyncMemory 一致性深度分析（add/search/get_all）
+description: 逐步拆解 Mem0 同步与异步主流程的对齐实现，含完整案例与 ANSI 时序图。
+---
+
+## 为什么这不是“语法糖”
+
+Mem0 同时维护 `Memory`（sync）和 `AsyncMemory`（async）两条主流程，不是简单地把同步接口套一层 `await`。
+
+核心原因是：在脚本、Web 服务、异步 Agent Runtime 三类运行时下，需要维持**相同能力**与**相同数据语义**（包括 session scope、过滤器、结果结构、图谱扩展等）。
+
+在官方文档中，`AsyncMemory` 也明确以“method parity”作为目标：`add / search / get_all` 与同步版本参数和返回形状保持一致。
+
+---
+
+## 总体架构：同一文件、两套并行实现
+
+`mem0/memory/main.py` 中同时实现了：
+
+- `class Memory`（同步）
+- `class AsyncMemory`（异步）
+
+且两者都覆盖了核心生命周期方法：
+
+- `add`
+- `get_all`
+- `search`
+
+并复用同一组关键辅助逻辑（例如过滤器构造、payload 规范化等），保证“行为趋同、执行模型不同”。
+
+---
+
+
+## 两者分别是如何实现的（直观版）
+
+下面用“同一能力、两种执行模型”来对照：
+
+| 能力 | `Memory`（sync）实现方式 | `AsyncMemory`（async）实现方式 |
+| --- | --- | --- |
+| `add` 主入口 | 普通函数，内部用 `ThreadPoolExecutor` 并发跑 vector/graph 两分支 | `async def`，内部用 `asyncio.create_task + gather` 并发两分支 |
+| vector 分支里的阻塞操作 | 直接调用（embedding、vector_store、llm） | 用 `asyncio.to_thread(...)` 包装阻塞调用，避免阻塞事件循环 |
+| `get_all` | 线程池并发 vector list + graph get_all（若启用） | task/gather 并发；图谱方法若非协程则转 `to_thread` |
+| `search` | 同步 embedding + search，再做阈值与 rerank | `to_thread` 执行 embedding/search，rerank 也放到线程避免阻塞 |
+| 返回结构 | `{"results": ...}`，图模式附加 `relations` | 与 sync 保持同形状 |
+
+一句话：**业务语义复用同一套（过滤器、输出格式、动作语义），并发与调度方式按运行时分别实现。**
+
+---
+
+## 代码级“分别实现”示例（最小可读）
+
+### A. `add` 的并发实现差异
+
+```python
+# Memory.add（sync）核心形态
+with concurrent.futures.ThreadPoolExecutor() as executor:
+    future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer)
+    future2 = executor.submit(self._add_to_graph, messages, effective_filters)
+    concurrent.futures.wait([future1, future2])
+    vector_store_result = future1.result()
+    graph_result = future2.result()
+```
+
+```python
+# AsyncMemory.add（async）核心形态
+vector_store_task = asyncio.create_task(
+    self._add_to_vector_store(messages, processed_metadata, effective_filters, infer)
+)
+graph_task = asyncio.create_task(self._add_to_graph(messages, effective_filters))
+vector_store_result, graph_result = await asyncio.gather(vector_store_task, graph_task)
+```
+
+实现差异点：
+
+- sync 版本把并发交给线程池。
+- async 版本把并发交给事件循环；但底层阻塞 I/O 仍通过 `to_thread` 迁移到线程。
+
+### B. `search` 的阻塞调用处理差异
+
+```python
+# Memory._search_vector_store（sync）
+embeddings = self.embedding_model.embed(query, "search")
+memories = self.vector_store.search(query=query, vectors=embeddings, limit=limit, filters=filters)
+```
+
+```python
+# AsyncMemory._search_vector_store（async）
+embeddings = await asyncio.to_thread(self.embedding_model.embed, query, "search")
+memories = await asyncio.to_thread(
+    self.vector_store.search, query=query, vectors=embeddings, limit=limit, filters=filters
+)
+```
+
+实现差异点：
+
+- sync 直接执行阻塞调用。
+- async 把阻塞调用转到线程，保证 event loop 可继续调度其它任务。
+
+---
+
+## 共同基座：_build_filters_and_metadata
+
+两条流程在 `add/search/get_all` 开始处都先调用 `_build_filters_and_metadata(...)`：
+
+- 合并 `user_id / agent_id / run_id`
+- 形成写入用 metadata 模板
+- 形成查询用 effective filters
+
+这一步是两套流程行为一致的根：
+
+- **同样的 session 作用域规则**
+- **同样的过滤器输入约束**
+- **同样的上层 API 心智模型**
+
+---
+
+## add 对齐分析（逐步）
+
+### 1）入参与路由（sync/async 一致）
+
+两边都做：
+
+1. `memory_type` 校验
+2. `messages` 归一化（str/dict/list）
+3. procedural memory 分支路由（`agent_id + procedural_memory`）
+
+### 2）执行模型不同，但功能相同
+
+#### Sync `Memory.add`
+
+- 用 `ThreadPoolExecutor` 并行执行：
+  - `_add_to_vector_store(...)`
+  - `_add_to_graph(...)`
+- 等待两边完成后合并返回：
+  - 无图谱：`{"results": ...}`
+  - 有图谱：`{"results": ..., "relations": ...}`
+
+#### Async `AsyncMemory.add`
+
+- 用 `asyncio.create_task + gather` 并行执行同样的两条分支：
+  - `self._add_to_vector_store(...)`
+  - `self._add_to_graph(...)`
+- 阻塞依赖（embedding、vector store、graph）通过 `asyncio.to_thread` 包装
+- 返回结构保持一致
+
+### 3）vector 主逻辑一致
+
+两边 `_add_to_vector_store` 的逻辑骨架一致：
+
+- `infer=False`：逐条消息直接写入，返回 `ADD` 事件
+- `infer=True`：
+  1. 解析消息
+  2. LLM 抽取 facts
+  3. 向量检索已有记忆
+  4. 再次 LLM 决定动作（ADD/UPDATE/DELETE/NONE）
+  5. 执行动作并返回事件列表
+
+这使得“是否抽取事实、是否更新旧记忆”的业务语义在 sync/async 两边保持一致。
+
+---
+
+## get_all 对齐分析（逐步）
+
+两边流程基本镜像：
+
+1. 先构造 `effective_filters`
+2. 校验至少一个 scope id（`user_id/agent_id/run_id`）
+3. 采集 telemetry
+4. 并发获取：
+   - vector list
+   - graph get_all（若启用）
+5. 格式化返回
+
+### 结果格式化规则一致
+
+同步与异步都按同样规则将 vector payload 映射为输出对象：
+
+- 标准字段：`id/memory/hash/created_at/updated_at`
+- 提升字段：`user_id/agent_id/run_id/actor_id/role`
+- 其他字段收敛进 `metadata`
+
+因此业务层拿到的 `results` 结构一致。
+
+---
+
+## search 对齐分析（逐步）
+
+两边流程一致：
+
+1. 构建 scope filters
+2. 校验最少 scope id
+3. 处理高级过滤器（`AND/OR/NOT`, `eq/ne/in/...`）
+4. embedding + vector search
+5. 规范化结果 + threshold 过滤
+6. 可选 rerank
+7. 图谱结果合并（若启用）
+
+### 高级过滤器语义一致
+
+`_has_advanced_operators` 和 `_process_metadata_filters` 在 sync/async 两边均存在等价实现，确保复杂过滤表达式的解释一致。
+
+---
+
+## “一致”中的差异点（值得注意）
+
+虽然主流程高度对齐，但仍有细节差异可继续收敛：
+
+1. `add` 对非法 `memory_type` 的异常类型不同：
+   - sync: `Mem0ValidationError`
+   - async: `ValueError`
+
+2. 部分错误文案细节不同（例如 `get_all/search` 的 ValueError 文案）。
+
+3. `AsyncMemory.search` 的签名中存在 `metadata_filters` 参数，但当前主逻辑仍基于 `filters` 路径处理，调用方可能产生“参数存在但未生效”的理解偏差。
+
+> 这些差异不改变主流程的整体一致性，但在 SDK 体验与错误处理统一性上有改进空间。
+
+---
+
+## 举例说明：同一业务在两套实现中的调用
+
+场景：记录“用户喜欢乌龙茶”，随后列出和检索。无论 sync 还是 async，**输入参数与结果结构保持一致**，只是在调用方式上一个直接调用、一个 `await`。
+
+## 完整案例：sync + async 对照
+
+```python
+# sync 示例
+from mem0 import Memory
+
+m = Memory()
+
+m.add(
+    messages=[
+        {"role": "user", "content": "我喜欢喝乌龙茶", "name": "alice"},
+        {"role": "assistant", "content": "记住了"}
+    ],
+    user_id="u1",
+    infer=False,
+)
+
+sync_all = m.get_all(user_id="u1")
+sync_search = m.search("乌龙茶", user_id="u1")
+
+print(sync_all)
+print(sync_search)
+```
+
+```python
+# async 示例
+import asyncio
+from mem0 import AsyncMemory
+
+async def main():
+    m = AsyncMemory()
+
+    await m.add(
+        messages=[
+            {"role": "user", "content": "我喜欢喝乌龙茶", "name": "alice"},
+            {"role": "assistant", "content": "记住了"}
+        ],
+        user_id="u1",
+        infer=False,
+    )
+
+    async_all = await m.get_all(user_id="u1")
+    async_search = await m.search("乌龙茶", user_id="u1")
+
+    print(async_all)
+    print(async_search)
+
+asyncio.run(main())
+```
+
+如果后端配置与数据一致，两个结果应在结构上对齐：
+
+- 都返回 `{"results": [...]}`
+- 都遵循同样的 metadata 展开规则
+- 启用图谱时都附加 `relations`
+
+---
+
+## ANSI Art 时序图（add 主路径）
+
+```text
++------------------+                +----------------------+
+|   Caller (sync)  |                |   Caller (async)     |
++--------+---------+                +----------+-----------+
+         |                                     |
+         | add(...)                            | await add(...)
+         v                                     v
++-----------------------+           +------------------------+
+| normalize+build scope |           | normalize+build scope  |
++-----------+-----------+           +------------+-----------+
+            |                                    |
+            | ThreadPool submit                  | create_task(vector)
+            |  - vector branch                   | create_task(graph)
+            |  - graph branch                    |
+            v                                    v
++-----------------------+           +------------------------+
+| _add_to_vector_store  |           | _add_to_vector_store   |
+| facts/search/actions  |           | facts/search/actions   |
++-----------+-----------+           +------------+-----------+
+            |                                    |
+            +-----------+            +-----------+
+                        |            |
+                        v            v
+                 +------------------------+
+                 | gather/wait both branch|
+                 +-----------+------------+
+                             |
+                             v
+                 +------------------------+
+                 | return results(+graph) |
+                 +------------------------+
+```
+
+---
+
+## 小结
+
+Mem0 在 `Memory` 与 `AsyncMemory` 上采取的是“并行实现 + 语义对齐”的工程策略：
+
+- **输入模型一致**
+- **输出模型一致**
+- **过滤器与作用域规则一致**
+- **vector/graph 双分支一致**
+
+不同点主要在于并发与执行模型（线程池 vs 事件循环 + to_thread）以及少量异常/参数细节。整体上，这是一种可长期维护、可避免 sync/async 能力分裂的实现方式。
