@@ -191,6 +191,69 @@ description: 从代码实现视角拆解 Mem0 的提示词治理策略，包含�
 
 ---
 
+## 关键问题：LLM 到底如何区分 `ADD` 和 `UPDATE`？
+
+你提到的两个例子非常关键，本质是：
+
+- **并存偏好（multi-value preference）**：喜欢 A，后来又喜欢 B，通常应并存；
+- **单槽位偏好（single-slot preference）**：原来喜欢小米汽车，后来喜欢 Tesla，可能是“替换”。
+
+在当前实现里，这个区分不是硬编码规则，而是由**更新决策 Prompt + 检索到的旧记忆上下文**共同决定：
+
+1. 系统把新事实和检索到的旧记忆一起交给更新 LLM。  
+2. 更新 LLM 根据 Prompt 中“语义相同/冲突/补充”的描述，输出 `ADD`、`UPDATE`、`DELETE` 或 `NONE`。  
+3. 代码只负责执行，不再二次推理。
+
+换句话说：**“是并存还是替换”主要取决于 Prompt 的策略表达是否足够清晰**。如果 Prompt 没有定义“槽位冲突规则”，模型可能在边界场景不稳定。
+
+### 例子 A：`喜欢A` -> `喜欢B`（通常并存）
+
+当两条偏好可并存（例如音乐、电影、菜系等可多值集合）时，模型常见两种行为：
+
+- `ADD` 新条目（A 保留 + B 新增）；
+- `UPDATE` 为聚合表达（“喜欢 A 和 B”）。
+
+二者都不算错误，取决于你的数据建模偏好（离散存储 vs 聚合存储）。
+
+### 例子 B：`喜欢小米汽车` -> `喜欢Tesla`（可能替换）
+
+如果你把“汽车品牌偏好”视为**单槽位**，理想行为通常是：
+
+- `UPDATE`：将同一槽位从“小米”改为“Tesla”；或
+- `DELETE + ADD`：先删旧偏好，再加新偏好。
+
+若 Prompt 未声明这是单槽位，LLM 可能也会当成并存偏好而 `ADD`，这正是你担心的问题。
+
+### 为什么代码层难以自动区分？
+
+当前主流程没有领域本体（ontology）或字段 schema 来声明“哪些偏好可多值、哪些必须单值”；因此系统无法在代码中硬判“车品牌必须替换”。它依赖 Prompt 语义治理。
+
+---
+
+## 如何让区分稳定：给 Update Prompt 增加“槽位冲突规则”
+
+建议在 `custom_update_memory_prompt` 中显式加入以下规则：
+
+1. **多值槽位（ADD 优先）**  
+   例如：爱好、电影、菜系、运动。新值默认并存，除非用户明确否定旧值。
+2. **单值槽位（UPDATE 优先）**  
+   例如：当前首选汽车品牌、当前居住城市、当前职位。新值出现时替换旧值。
+3. **强冲突触发 DELETE/UPDATE**  
+   明确否定词（“不再”“改为”“从 X 换成 Y”“现在只用 Y”）出现时，优先替换/删除旧记忆。
+
+你可以直接把这类规范写进 Prompt（示意）：
+
+```text
+Slot policy:
+- Multi-value slots: hobbies, favorite_food, favorite_movies => prefer ADD or merge-update.
+- Single-value slots: preferred_car_brand, current_city, current_job => prefer UPDATE (replace old value).
+- If user expresses replacement cues ("改为", "换成", "不再", "现在只") => UPDATE or DELETE old conflicting memory.
+```
+
+这样，`喜欢A -> 喜欢B` 与 `喜欢小米汽车 -> 喜欢Tesla` 会按不同槽位策略落到不同 event。
+
+---
+
 ## ANSI Art 时序图（端到端）
 
 ```text
