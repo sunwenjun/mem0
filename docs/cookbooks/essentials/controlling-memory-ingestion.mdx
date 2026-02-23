@@ -371,6 +371,32 @@ client.delete(memory_id)
 
 ```
 
+### Handling temporal facts ("current" vs "used to")
+
+By default, Mem0's update pipeline prefers a **single current truth** for contradictory facts. For a sequence like:
+
+- Old memory: `Works in Beijing`
+- New message: `Moved to Shanghai last month`
+
+the model will usually update or delete the Beijing memory and keep Shanghai as the latest state.
+
+If your product needs historical facts like **"used to work in Beijing"**, use one of these patterns:
+
+1. **Temporal rewrite in update prompt (recommended)**
+   - Set `custom_update_memory_prompt` so contradictions are converted to a historical memory instead of a hard delete.
+   - Example rule: *"When a location/job changes, keep old value as `Used to ... (until DATE)` and add new current value."*
+
+2. **Dual-memory schema**
+   - Maintain two memory types in text/metadata:
+     - `employment_current: Works in Shanghai`
+     - `employment_history: Worked in Beijing (ended 2025-01)`
+   - You can enforce this with a custom extraction/update prompt and deterministic post-processing.
+
+3. **Audit-first retrieval**
+   - For compliance-style use cases, query memory `history()` alongside live memory so deleted/updated values are still inspectable.
+
+Use pattern (1) for conversational assistants, (2) for profile systems, and (3) for audits/debugging.
+
 ---
 
 ## Putting It Together
